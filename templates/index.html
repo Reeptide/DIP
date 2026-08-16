@@ -1,0 +1,1665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Distributed Image Processing Pipeline</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #6366f1;
+            --primary-dark: #4f46e5;
+            --success: #10b981;
+            --warning: #f59e0b;
+            --error: #ef4444;
+            --bg-dark: #0f172a;
+            --bg-card: #1e293b;
+            --bg-hover: #334155;
+            --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8;
+            --border: #334155;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            color: var(--text-primary);
+            min-height: 100vh;
+            line-height: 1.6;
+        }
+
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 400px;
+            gap: 24px;
+            max-width: 1600px;
+            margin: 0 auto;
+            padding: 32px 24px;
+            min-height: 100vh;
+        }
+
+        /* Left Panel - Main Content */
+        .main-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        /* Header */
+        .header {
+            text-align: left;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 8px;
+        }
+
+        .header p {
+            color: var(--text-secondary);
+            font-size: 1.1rem;
+        }
+
+        /* Upload Card */
+        .card {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 32px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--border);
+        }
+
+        .card-title {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 24px;
+            color: var(--text-primary);
+        }
+
+        /* Form Styling */
+        .form-group {
+            margin-bottom: 24px;
+        }
+
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .file-input-wrapper {
+            position: relative;
+            overflow: hidden;
+            display: inline-block;
+            width: 100%;
+        }
+
+        .file-input-wrapper input[type=file] {
+            position: absolute;
+            left: -9999px;
+        }
+
+        .file-input-label {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 48px;
+            background: var(--bg-dark);
+            border: 2px dashed var(--border);
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-align: center;
+        }
+
+        .file-input-label:hover {
+            border-color: var(--primary);
+            background: rgba(99, 102, 241, 0.05);
+        }
+
+        .file-input-label.has-file {
+            border-color: var(--success);
+            background: rgba(16, 185, 129, 0.05);
+        }
+
+        .file-info {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .file-icon {
+            font-size: 3rem;
+        }
+
+        .file-text {
+            color: var(--text-secondary);
+        }
+
+        .file-name {
+            color: var(--success);
+            font-weight: 500;
+            margin-top: 8px;
+        }
+
+        select {
+            width: 100%;
+            padding: 14px 16px;
+            background: var(--bg-dark);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            color: var(--text-primary);
+            font-size: 1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+
+        select:hover {
+            border-color: var(--primary);
+        }
+
+        select:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        .btn {
+            width: 100%;
+            padding: 16px;
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 12px rgba(99, 102, 241, 0.3);
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(99, 102, 241, 0.4);
+        }
+
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Status Card */
+        .status-card {
+            display: none;
+            animation: slideIn 0.3s ease;
+        }
+
+        .status-card.show {
+            display: block;
+        }
+
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .status-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .status-badge {
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .status-processing {
+            background: rgba(245, 158, 11, 0.2);
+            color: var(--warning);
+        }
+
+        .status-completed {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+
+        .status-error {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--error);
+        }
+
+        .progress-container {
+            margin: 24px 0;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 12px;
+            background: var(--bg-dark);
+            border-radius: 6px;
+            overflow: hidden;
+            margin-top: 12px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--primary), var(--primary-dark));
+            transition: width 0.5s ease;
+            border-radius: 6px;
+        }
+
+        .progress-text {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 16px;
+            margin-top: 24px;
+        }
+
+        .info-item {
+            background: var(--bg-dark);
+            padding: 16px;
+            border-radius: 8px;
+        }
+
+        .info-label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 4px;
+        }
+
+        .info-value {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .btn-download {
+            background: linear-gradient(135deg, var(--success) 0%, #059669 100%);
+            margin-top: 20px;
+        }
+
+        .btn-download:hover {
+            box-shadow: 0 6px 20px rgba(16, 185, 129, 0.4);
+        }
+
+        /* Right Panel - Dashboard */
+        .dashboard-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        .dashboard-card {
+            background: var(--bg-card);
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--border);
+        }
+
+        .dashboard-title {
+            font-size: 1.2rem;
+            font-weight: 600;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .stat-box {
+            background: var(--bg-dark);
+            padding: 20px;
+            border-radius: 12px;
+            text-align: center;
+            margin-bottom: 16px;
+        }
+
+        .stat-value {
+            font-size: 2.5rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .stat-label {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 4px;
+        }
+
+        .worker-list {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .worker-item {
+            background: var(--bg-dark);
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            border-left: 4px solid var(--success);
+            transition: all 0.3s ease;
+        }
+
+        .worker-item.warning {
+            border-left-color: var(--warning);
+        }
+
+        .worker-item.error {
+            border-left-color: var(--error);
+        }
+
+        .worker-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .worker-id {
+            font-family: 'Courier New', monospace;
+            font-size: 0.9rem;
+            color: var(--text-primary);
+            display: flex;
+            align-items: center;
+        }
+
+        .heartbeat-indicator {
+            width: 8px;
+            height: 8px;
+            background: var(--success);
+            border-radius: 50%;
+            animation: heartbeat 1.5s ease-in-out infinite;
+            display: inline-block;
+            margin-right: 6px;
+        }
+
+        .heartbeat-indicator.warning {
+            background: var(--warning);
+            animation-duration: 0.8s;
+        }
+
+        .heartbeat-indicator.error {
+            background: var(--error);
+            animation: none;
+        }
+
+        @keyframes heartbeat {
+            0%, 100% { transform: scale(1); opacity: 1; }
+            50% { transform: scale(1.2); opacity: 0.8; }
+        }
+
+        .heartbeat-info {
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-top: 8px;
+        }
+
+        .heartbeat-detail {
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .heartbeat-value {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .heartbeat-stats {
+            background: var(--bg-dark);
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            border: 1px solid var(--border);
+        }
+
+        .stats-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 4px 0;
+        }
+
+        .health-bar {
+            width: 100%;
+            height: 6px;
+            background: var(--bg-card);
+            border-radius: 3px;
+            overflow: hidden;
+            margin: 8px 0;
+        }
+
+        .health-fill {
+            height: 100%;
+            background: linear-gradient(90deg, var(--success), var(--primary));
+            transition: width 0.5s ease;
+        }
+
+        .update-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+        }
+
+        .update-dot {
+            width: 6px;
+            height: 6px;
+            background: var(--success);
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% {
+                opacity: 1;
+            }
+            50% {
+                opacity: 0.5;
+            }
+        }
+
+        .system-info {
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .system-info-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .system-info-item:last-child {
+            border-bottom: none;
+        }
+
+        .system-info-value {
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        /* Alerts */
+        .alert {
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            animation: slideIn 0.3s ease;
+        }
+
+        .alert-success {
+            background: rgba(16, 185, 129, 0.1);
+            border: 1px solid var(--success);
+            color: var(--success);
+        }
+
+        .alert-error {
+            background: rgba(239, 68, 68, 0.1);
+            border: 1px solid var(--error);
+            color: var(--error);
+        }
+
+        .alert-warning {
+            background: rgba(245, 158, 11, 0.1);
+            border: 1px solid var(--warning);
+            color: var(--warning);
+        }
+
+        /* Metadata Modal Styles */
+        .metadata-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            z-index: 1000;
+            backdrop-filter: blur(5px);
+        }
+        
+        .metadata-modal.show {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            animation: fadeIn 0.3s ease;
+        }
+        
+        .metadata-content {
+            background: var(--bg-card);
+            width: 90%;
+            max-width: 1200px;
+            height: 85%;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            border: 1px solid var(--border);
+        }
+        
+        .metadata-header {
+            background: linear-gradient(135deg, #4a5568 0%, #2d3748 100%);
+            padding: 20px 24px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .metadata-title {
+            color: white;
+            font-size: 1.5rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .close-button {
+            background: rgba(255, 255, 255, 0.1);
+            border: none;
+            color: white;
+            width: 40px;
+            height: 40px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1.2rem;
+            transition: all 0.3s ease;
+        }
+        
+        .close-button:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
+        
+        .metadata-tabs {
+            display: flex;
+            background: var(--bg-dark);
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .tab-button {
+            background: none;
+            border: none;
+            padding: 16px 24px;
+            color: var(--text-secondary);
+            cursor: pointer;
+            font-size: 0.95rem;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            border-bottom: 3px solid transparent;
+        }
+        
+        .tab-button.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+            background: rgba(99, 102, 241, 0.1);
+        }
+        
+        .tab-button:hover {
+            color: var(--text-primary);
+            background: rgba(255, 255, 255, 0.05);
+        }
+        
+        .metadata-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+            animation: slideIn 0.3s ease;
+        }
+        
+        .summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+            margin-bottom: 24px;
+        }
+        
+        .summary-card {
+            background: var(--bg-dark);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }
+        
+        .summary-card h3 {
+            color: var(--primary);
+            font-size: 1.1rem;
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .summary-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        .summary-row:last-child {
+            border-bottom: none;
+        }
+        
+        .summary-label {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+        }
+        
+        .summary-value {
+            color: var(--text-primary);
+            font-weight: 600;
+        }
+        
+        .jobs-table {
+            background: var(--bg-dark);
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid var(--border);
+        }
+        
+        .table-header {
+            background: linear-gradient(135deg, var(--primary) 0%, var(--primary-dark) 100%);
+            padding: 16px 20px;
+            color: white;
+            font-weight: 600;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .jobs-grid {
+            display: grid;
+            grid-template-columns: 1fr 120px 120px 100px 120px 150px 100px 120px;
+            gap: 16px;
+            padding: 16px 20px;
+            align-items: center;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.9rem;
+        }
+        
+        .jobs-grid:last-child {
+            border-bottom: none;
+        }
+        
+        .jobs-grid.header {
+            background: var(--bg-card);
+            color: var(--text-secondary);
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.8rem;
+            letter-spacing: 0.5px;
+        }
+        
+        .job-id {
+            font-family: 'Courier New', monospace;
+            color: var(--primary);
+        }
+        
+        .status-badge-small {
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        
+        .status-completed {
+            background: rgba(16, 185, 129, 0.2);
+            color: var(--success);
+        }
+        
+        .status-processing {
+            background: rgba(245, 158, 11, 0.2);
+            color: var(--warning);
+        }
+        
+        .status-failed {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--error);
+        }
+        
+        .progress-mini {
+            width: 60px;
+            height: 6px;
+            background: var(--bg-card);
+            border-radius: 3px;
+            overflow: hidden;
+        }
+        
+        .progress-mini-fill {
+            height: 100%;
+            background: var(--success);
+            transition: width 0.3s ease;
+        }
+        
+        .raw-data {
+            background: var(--bg-dark);
+            border-radius: 12px;
+            padding: 20px;
+            border: 1px solid var(--border);
+        }
+        
+        .raw-data pre {
+            color: var(--text-primary);
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            max-height: 500px;
+            overflow-y: auto;
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 12px;
+            margin-top: 16px;
+            flex-wrap: wrap;
+        }
+        
+        .btn-action {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 10px 16px;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .btn-action:hover {
+            background: var(--primary-dark);
+            transform: translateY(-1px);
+        }
+        
+        .btn-warning {
+            background: var(--warning);
+        }
+        
+        .btn-warning:hover {
+            background: #d97706;
+        }
+        
+        .btn-danger {
+            background: var(--error);
+        }
+        
+        .btn-danger:hover {
+            background: #dc2626;
+        }
+        
+        .no-data {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-secondary);
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        /* Responsive Design */
+        @media (max-width: 1200px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+
+            .dashboard-panel {
+                order: -1;
+            }
+        }
+
+        /* Scrollbar Styling */
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-dark);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: var(--primary);
+        }
+
+        /* Loading Spinner */
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Left Panel - Main Content -->
+        <div class="main-panel">
+            <!-- Header -->
+            <div class="header">
+                <h1>Image Processing Pipeline</h1>
+                <p>Distributed processing with Kafka & Redis</p>
+            </div>
+
+            <!-- Alert Messages -->
+            <div id="alertContainer"></div>
+
+            <!-- Upload Section -->
+            <div class="card">
+                <h2 class="card-title">Upload & Process</h2>
+                
+                <form id="uploadForm">
+                    <div class="form-group">
+                        <label class="form-label">Select Image</label>
+                        <div class="file-input-wrapper">
+                            <input type="file" id="imageInput" name="image" accept="image/*" required>
+                            <label for="imageInput" class="file-input-label" id="fileLabel">
+                                <div class="file-info">
+                                    <div class="file-icon">📁</div>
+                                    <div class="file-text">Click to select image or drag & drop</div>
+                                    <div class="file-text" style="font-size: 0.85rem;">Min: 1024x1024px • Max: 8192x8192px</div>
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="operation" class="form-label">Processing Operation</label>
+                        <select id="operation" name="operation" required>
+                            {% for key, value in operations.items() %}
+                            <option value="{{ key }}">{{ value }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    <button type="submit" class="btn" id="submitBtn">
+                        Start Processing
+                    </button>
+                </form>
+            </div>
+
+            <!-- Status Section -->
+            <div class="card status-card" id="statusCard">
+                <div class="status-header">
+                    <h2 class="card-title" style="margin: 0;">Processing Status</h2>
+                    <span class="status-badge" id="statusBadge">Processing</span>
+                </div>
+
+                <div class="progress-container">
+                    <div class="progress-text">
+                        <span>Progress</span>
+                        <span id="progressText">0%</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progressFill" style="width: 0%"></div>
+                    </div>
+                </div>
+
+                <div class="info-grid">
+                    <div class="info-item">
+                        <div class="info-label">Job ID</div>
+                        <div class="info-value" id="jobIdDisplay" style="font-size: 0.9rem; font-family: monospace;">-</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Operation</div>
+                        <div class="info-value" id="operationDisplay">-</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Tiles Processed</div>
+                        <div class="info-value" id="tilesDisplay">0 / 0</div>
+                    </div>
+                    <div class="info-item">
+                        <div class="info-label">Workers Active</div>
+                        <div class="info-value" id="workersDisplay">0</div>
+                    </div>
+                </div>
+
+                <button class="btn btn-download" id="downloadBtn" style="display: none;">
+                    Download Processed Image
+                </button>
+            </div>
+        </div>
+
+        <!-- Right Panel - Dashboard -->
+        <div class="dashboard-panel">
+            <!-- System Status -->
+            <div class="dashboard-card">
+                <h3 class="dashboard-title">⚡ System Status</h3>
+                
+                <div class="stat-box">
+                    <div class="stat-value" id="workerCount">0</div>
+                    <div class="stat-label">Active Workers</div>
+                </div>
+
+                <div class="system-info">
+                    <div class="system-info-item">
+                        <span>Kafka</span>
+                        <span class="system-info-value" id="kafkaStatus">●</span>
+                    </div>
+                    <div class="system-info-item">
+                        <span>Redis</span>
+                        <span class="system-info-value" id="redisStatus">●</span>
+                    </div>
+                    <div class="system-info-item">
+                        <span>Operations</span>
+                        <span class="system-info-value" id="opsCount">{{ operations|length }}</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Storage Management -->
+            <div class="dashboard-card">
+                <h3 class="dashboard-title">🗄️ Storage Management</h3>
+                <button class="btn" id="openMetadataBtn" style="width: 100%;">
+                    📊 View Redis Metadata
+                </button>
+            </div>
+
+            <!-- Worker Heartbeats -->
+            <div class="dashboard-card">
+                <h3 class="dashboard-title">💓 Worker Heartbeats</h3>
+                
+                <!-- Heartbeat Statistics -->
+                <div class="heartbeat-stats" id="heartbeatStats">
+                    <div class="stats-row">
+                        <span>System Health</span>
+                        <span class="heartbeat-value" id="healthPercentage">100%</span>
+                    </div>
+                    <div class="health-bar">
+                        <div class="health-fill" id="healthBar" style="width: 100%"></div>
+                    </div>
+                    <div class="stats-row">
+                        <span>Active Workers</span>
+                        <span class="heartbeat-value" id="activeWorkerCount">0</span>
+                    </div>
+                    <div class="stats-row">
+                        <span>Last Update</span>
+                        <span class="heartbeat-value" id="lastUpdate">--:--:--</span>
+                    </div>
+                </div>
+                
+                <!-- Worker List with Heartbeat Details -->
+                <div class="worker-list" id="workerList">
+                    <div style="text-align: center; color: var(--text-secondary); padding: 20px;">
+                        <div class="update-indicator">
+                            <div class="update-dot"></div>
+                            <span>Waiting for worker heartbeats...</span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Real-time Update Status -->
+                <div class="refresh-info">
+                    <div class="update-indicator">
+                        <div class="update-dot"></div>
+                        <span>Real-time heartbeat monitoring • Updates every 3s</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Metadata Modal -->
+    <div class="metadata-modal" id="metadataModal">
+        <div class="metadata-content">
+            <div class="metadata-header">
+                <div class="metadata-title">
+                    🗄️ Redis Metadata Storage
+                </div>
+                <button class="close-button" id="closeMetadataBtn">×</button>
+            </div>
+            
+            <div class="metadata-tabs">
+                <button class="tab-button active" data-tab="summary">Summary</button>
+                <button class="tab-button" data-tab="jobs">All Jobs</button>
+                <button class="tab-button" data-tab="raw">Raw Data</button>
+            </div>
+            
+            <div class="metadata-body">
+                <!-- Summary Tab -->
+                <div class="tab-content active" id="summary-tab">
+                    <div class="summary-grid">
+                        <div class="summary-card">
+                            <h3>📈 Redis Storage Summary</h3>
+                            <div class="summary-row">
+                                <span class="summary-label">Total Jobs:</span>
+                                <span class="summary-value" id="totalJobs">0</span>
+                            </div>
+                            <div class="summary-row">
+                                <span class="summary-label">Redis Keys:</span>
+                                <span class="summary-value" id="redisKeys">0</span>
+                            </div>
+                            <div class="summary-row">
+                                <span class="summary-label">Job Keys:</span>
+                                <span class="summary-value" id="jobKeys">0</span>
+                            </div>
+                            <div class="summary-row">
+                                <span class="summary-label">Tile Keys:</span>
+                                <span class="summary-value" id="tileKeys">0</span>
+                            </div>
+                        </div>
+                        
+                        <div class="summary-card">
+                            <h3>🗂️ Storage Details</h3>
+                            <div class="summary-row">
+                                <span class="summary-label">Database Type:</span>
+                                <span class="summary-value">Redis (Key-Value NoSQL Database)</span>
+                            </div>
+                            <div class="summary-row">
+                                <span class="summary-label">Active Workers:</span>
+                                <span class="summary-value" id="activeWorkersCount">0</span>
+                            </div>
+                            <div class="summary-row">
+                                <span class="summary-label">Last Updated:</span>
+                                <span class="summary-value" id="lastUpdated">--</span>
+                            </div>
+                        </div>
+
+                        <!-- NEW: Cleanup Information Card -->
+                        <div class="summary-card">
+                            <h3>🧹 Cleanup Information</h3>
+                            <div class="summary-row">
+                                <span class="summary-label">Orphaned Keys:</span>
+                                <span class="summary-value" id="orphanedKeys">0</span>
+                            </div>
+                            <div class="summary-row">
+                                <span class="summary-label">Status Keys:</span>
+                                <span class="summary-value" id="statusKeys">0</span>
+                            </div>
+                            <div class="summary-row">
+                                <span class="summary-label">Result Keys:</span>
+                                <span class="summary-value" id="resultKeys">0</span>
+                            </div>
+                            <div class="summary-row">
+                                <span class="summary-label">Counter Keys:</span>
+                                <span class="summary-value" id="counterKeys">0</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- UPDATED: Action buttons with cleanup functionality -->
+                    <div class="action-buttons">
+                        <button class="btn-action" id="refreshMetadata">
+                            🔄 Refresh Data
+                        </button>
+                        <button class="btn-action btn-warning" id="cleanupOrphaned">
+                            🧹 Cleanup Orphaned Keys
+                        </button>
+                        <button class="btn-action btn-danger" id="clearOldJobs">
+                            🗑️ Clear Old Jobs
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Jobs Tab -->
+                <div class="tab-content" id="jobs-tab">
+                    <div class="jobs-table">
+                        <div class="table-header">
+                            <span>Processing Jobs History</span>
+                            <span id="jobCount">0 jobs</span>
+                        </div>
+                        <div class="jobs-grid header">
+                            <span>Job ID</span>
+                            <span>Operation</span>
+                            <span>Status</span>
+                            <span>Progress</span>
+                            <span>Tiles</span>
+                            <span>Processing Time</span>
+                            <span>Created</span>
+                            <span>Filename</span>
+                        </div>
+                        <div id="jobsList">
+                            <div class="no-data">No jobs found</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Raw Data Tab -->
+                <div class="tab-content" id="raw-tab">
+                    <div class="raw-data">
+                        <pre id="rawDataContent">Loading...</pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentJobId = null;
+        let statusCheckInterval = null;
+        let metadataData = null;
+
+        // File input handling
+        const imageInput = document.getElementById('imageInput');
+        const fileLabel = document.getElementById('fileLabel');
+
+        imageInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                fileLabel.classList.add('has-file');
+                fileLabel.innerHTML = `
+                    <div class="file-info">
+                        <div class="file-icon">✓</div>
+                        <div class="file-name">${file.name}</div>
+                        <div class="file-text">${(file.size / 1024 / 1024).toFixed(2)} MB</div>
+                    </div>
+                `;
+            }
+        });
+
+        // Form submission
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const formData = new FormData(e.target);
+            const submitBtn = document.getElementById('submitBtn');
+            
+            submitBtn.disabled = true;
+            submitBtn.innerHTML = '<span class="spinner"></span> Uploading...';
+            
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    currentJobId = data.job_id;
+                    showAlert('success', `Processing started! Job ID: ${data.job_id}`);
+                    
+                    // Show status card
+                    document.getElementById('statusCard').classList.add('show');
+                    document.getElementById('jobIdDisplay').textContent = data.job_id;
+                    document.getElementById('operationDisplay').textContent = data.operation;
+                    document.getElementById('workersDisplay').textContent = data.active_workers;
+                    document.getElementById('tilesDisplay').textContent = `0 / ${data.tiles_count}`;
+                    
+                    // Start status checking
+                    startStatusChecking(data.job_id);
+                } else {
+                    showAlert('error', data.error || 'Upload failed');
+                }
+            } catch (error) {
+                showAlert('error', 'Network error: ' + error.message);
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Start Processing';
+            }
+        });
+
+        // Status checking
+        function startStatusChecking(jobId) {
+            if (statusCheckInterval) {
+                clearInterval(statusCheckInterval);
+            }
+            
+            statusCheckInterval = setInterval(async () => {
+                try {
+                    const response = await fetch(`/status/${jobId}`);
+                    const data = await response.json();
+                    
+                    updateStatus(data);
+                    
+                    if (data.status === 'ready_for_reconstruction') {
+                        await reconstructImage(jobId);
+                    } else if (data.status === 'completed') {
+                        clearInterval(statusCheckInterval);
+                        showDownloadButton(jobId);
+                    }
+                } catch (error) {
+                    console.error('Status check error:', error);
+                }
+            }, 2000);
+        }
+
+        function updateStatus(data) {
+            const progressFill = document.getElementById('progressFill');
+            const progressText = document.getElementById('progressText');
+            const tilesDisplay = document.getElementById('tilesDisplay');
+            const statusBadge = document.getElementById('statusBadge');
+            
+            progressFill.style.width = data.progress + '%';
+            progressText.textContent = data.progress + '%';
+            tilesDisplay.textContent = `${data.received_tiles} / ${data.expected_tiles}`;
+            
+            if (data.status === 'completed') {
+                statusBadge.textContent = 'Completed';
+                statusBadge.className = 'status-badge status-completed';
+            } else {
+                statusBadge.textContent = 'Processing';
+                statusBadge.className = 'status-badge status-processing';
+            }
+        }
+
+        async function reconstructImage(jobId) {
+            try {
+                const response = await fetch(`/reconstruct/${jobId}`, { method: 'POST' });
+                const data = await response.json();
+                
+                if (response.ok) {
+                    showAlert('success', 'Image reconstructed successfully!');
+                } else {
+                    showAlert('error', data.error || 'Reconstruction failed');
+                }
+            } catch (error) {
+                showAlert('error', 'Reconstruction error: ' + error.message);
+            }
+        }
+
+        function showDownloadButton(jobId) {
+            const downloadBtn = document.getElementById('downloadBtn');
+            downloadBtn.style.display = 'block';
+            downloadBtn.onclick = () => {
+                window.location.href = `/result/${jobId}`;
+            };
+        }
+
+        // Metadata Modal Functionality
+        document.getElementById('openMetadataBtn').addEventListener('click', () => {
+            document.getElementById('metadataModal').classList.add('show');
+            loadMetadata();
+        });
+
+        document.getElementById('closeMetadataBtn').addEventListener('click', () => {
+            document.getElementById('metadataModal').classList.remove('show');
+        });
+
+        document.getElementById('metadataModal').addEventListener('click', (e) => {
+            if (e.target.id === 'metadataModal') {
+                document.getElementById('metadataModal').classList.remove('show');
+            }
+        });
+
+        // Tab switching
+        document.querySelectorAll('.tab-button').forEach(button => {
+            button.addEventListener('click', () => {
+                document.querySelectorAll('.tab-button').forEach(b => b.classList.remove('active'));
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                
+                button.classList.add('active');
+                document.getElementById(button.dataset.tab + '-tab').classList.add('active');
+            });
+        });
+
+        // Refresh metadata
+        document.getElementById('refreshMetadata').addEventListener('click', () => {
+            loadMetadata();
+        });
+
+        // NEW: Cleanup orphaned keys functionality
+        document.getElementById('cleanupOrphaned').addEventListener('click', async () => {
+            try {
+                // First, do a dry run
+                const dryResponse = await fetch('/metadata/cleanup', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ dry_run: true })
+                });
+                
+                const dryResult = await dryResponse.json();
+                
+                if (dryResponse.ok) {
+                    if (dryResult.orphaned_keys_found === 0) {
+                        showAlert('success', 'No orphaned keys found. Redis is clean!');
+                        return;
+                    }
+
+                    const confirmMsg = `Found ${dryResult.orphaned_keys_found} orphaned keys to clean up.\n\nThis will delete:\n• Old status keys\n• Old result keys\n• Orphaned tile keys\n• Unused metadata\n\nValid jobs: ${dryResult.valid_jobs}\nTotal keys: ${dryResult.total_keys}\n\nProceed with cleanup?`;
+                    
+                    if (confirm(confirmMsg)) {
+                        // Show loading state
+                        const cleanupBtn = document.getElementById('cleanupOrphaned');
+                        const originalText = cleanupBtn.innerHTML;
+                        cleanupBtn.innerHTML = '🧹 Cleaning...';
+                        cleanupBtn.disabled = true;
+
+                        // Actually do the cleanup
+                        const cleanupResponse = await fetch('/metadata/cleanup', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ dry_run: false })
+                        });
+                        
+                        const cleanupResult = await cleanupResponse.json();
+                        
+                        if (cleanupResponse.ok) {
+                            showAlert('success', `✅ Cleanup completed!\n• Deleted: ${cleanupResult.deleted_keys} orphaned keys\n• Remaining: ${cleanupResult.remaining_keys} valid keys\n• Valid jobs preserved: ${cleanupResult.valid_jobs}`);
+                            loadMetadata(); // Refresh metadata
+                        } else {
+                            showAlert('error', cleanupResult.error || 'Cleanup failed');
+                        }
+
+                        // Reset button
+                        cleanupBtn.innerHTML = originalText;
+                        cleanupBtn.disabled = false;
+                    }
+                } else {
+                    showAlert('error', dryResult.error || 'Failed to analyze keys for cleanup');
+                }
+            } catch (error) {
+                showAlert('error', 'Cleanup error: ' + error.message);
+                // Reset button on error
+                const cleanupBtn = document.getElementById('cleanupOrphaned');
+                cleanupBtn.innerHTML = '🧹 Cleanup Orphaned Keys';
+                cleanupBtn.disabled = false;
+            }
+        });
+
+        // Clear old jobs
+        document.getElementById('clearOldJobs').addEventListener('click', async () => {
+            if (confirm('Clear jobs older than 24 hours?\n\nThis will remove:\n• Job data and metadata\n• Associated tiles and results\n• Processing history\n\nThis action cannot be undone.')) {
+                try {
+                    const response = await fetch('/metadata/clear', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ older_than_hours: 24 })
+                    });
+                    
+                    const result = await response.json();
+                    if (response.ok) {
+                        showAlert('success', `Cleared ${result.cleared_jobs.length} old jobs: ${result.cleared_jobs.join(', ')}`);
+                        loadMetadata();
+                    } else {
+                        showAlert('error', result.error || 'Failed to clear jobs');
+                    }
+                } catch (error) {
+                    showAlert('error', 'Error clearing jobs: ' + error.message);
+                }
+            }
+        });
+
+        // Load metadata from API
+        async function loadMetadata() {
+            try {
+                const response = await fetch('/metadata');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    metadataData = data;
+                    updateMetadataUI(data);
+                } else {
+                    showAlert('error', data.error || 'Failed to load metadata');
+                }
+            } catch (error) {
+                console.error('Metadata load error:', error);
+                showAlert('error', 'Failed to load metadata');
+            }
+        }
+
+        // UPDATED: Update metadata UI with cleanup information
+        function updateMetadataUI(data) {
+            // Update summary
+            document.getElementById('totalJobs').textContent = data.total_jobs;
+            document.getElementById('redisKeys').textContent = data.redis_summary.total_keys;
+            document.getElementById('jobKeys').textContent = data.redis_summary.job_keys;
+            document.getElementById('tileKeys').textContent = data.redis_summary.tile_keys;
+            document.getElementById('activeWorkersCount').textContent = data.active_workers.count;
+            document.getElementById('lastUpdated').textContent = data.timestamp_readable;
+            
+            // Update cleanup info
+            document.getElementById('orphanedKeys').textContent = data.redis_summary.orphaned_keys || 0;
+            document.getElementById('statusKeys').textContent = data.redis_summary.status_keys || 0;
+            document.getElementById('resultKeys').textContent = data.redis_summary.result_keys || 0;
+            document.getElementById('counterKeys').textContent = data.redis_summary.counter_keys || 0;
+            
+            // Show cleanup warning if needed
+            if (data.cleanup_info && data.cleanup_info.cleanup_recommended) {
+                showAlert('warning', `⚠️ ${data.cleanup_info.total_orphaned} orphaned keys detected. Consider running cleanup to optimize Redis storage.`);
+            }
+            
+            // Update jobs list
+            const jobsList = document.getElementById('jobsList');
+            const jobCount = document.getElementById('jobCount');
+            
+            jobCount.textContent = `${data.total_jobs} jobs`;
+            
+            if (data.jobs.length === 0) {
+                jobsList.innerHTML = '<div class="no-data">No jobs found</div>';
+            } else {
+                jobsList.innerHTML = data.jobs.map(job => {
+                    let statusClass = 'status-completed';
+                    if (job.status === 'processing') statusClass = 'status-processing';
+                    if (job.status === 'failed') statusClass = 'status-failed';
+                    
+                    return `
+                        <div class="jobs-grid">
+                            <span class="job-id">${job.job_id}</span>
+                            <span>${job.operation}</span>
+                            <span class="status-badge-small ${statusClass}">${job.status}</span>
+                            <div class="progress-mini">
+                                <div class="progress-mini-fill" style="width: ${job.progress}%"></div>
+                            </div>
+                            <span>${job.tiles_received}/${job.total_tiles}</span>
+                            <span>${job.processing_time}</span>
+                            <span style="font-size: 0.8rem;">${job.created_at_readable.split(' ')[1]}</span>
+                            <span style="font-size: 0.8rem; opacity: 0.8;">${job.original_filename}</span>
+                        </div>
+                    `;
+                }).join('');
+            }
+            
+            // Update raw data
+            document.getElementById('rawDataContent').textContent = JSON.stringify(data, null, 2);
+        }
+
+        // Enhanced Dashboard updates with heartbeat display
+        async function updateDashboard() {
+            try {
+                const response = await fetch('/dashboard/data');
+                const data = await response.json();
+                
+                // Debug log
+                console.log('Dashboard data with heartbeats:', data);
+                
+                // Update main worker count
+                document.getElementById('workerCount').textContent = data.active_workers;
+                
+                // Update heartbeat statistics
+                if (data.heartbeat_stats) {
+                    const stats = data.heartbeat_stats;
+                    document.getElementById('healthPercentage').textContent = `${Math.round(stats.health_percentage)}%`;
+                    document.getElementById('healthBar').style.width = `${stats.health_percentage}%`;
+                    document.getElementById('activeWorkerCount').textContent = `${stats.healthy_workers}/${stats.total_workers}`;
+                    document.getElementById('lastUpdate').textContent = stats.last_update;
+                    
+                    // Update health bar color based on percentage
+                    const healthBar = document.getElementById('healthBar');
+                    if (stats.health_percentage >= 80) {
+                        healthBar.style.background = 'linear-gradient(90deg, var(--success), var(--primary))';
+                    } else if (stats.health_percentage >= 50) {
+                        healthBar.style.background = 'linear-gradient(90deg, var(--warning), var(--primary))';
+                    } else {
+                        healthBar.style.background = 'linear-gradient(90deg, var(--error), var(--warning))';
+                    }
+                }
+                
+                // Update worker list with detailed heartbeat info
+                const workerList = document.getElementById('workerList');
+                if (data.worker_list && data.worker_list.length > 0) {
+                    workerList.innerHTML = data.worker_list.map(worker => {
+                        // Determine worker health status
+                        let statusClass = '';
+                        let heartbeatClass = '';
+                        let statusText = 'Healthy';
+                        
+                        if (worker.last_seen_ago > 10) {
+                            statusClass = 'warning';
+                            heartbeatClass = 'warning';
+                            statusText = 'Slow';
+                        } else if (!worker.is_healthy) {
+                            statusClass = 'error';
+                            heartbeatClass = 'error';
+                            statusText = 'Timeout';
+                        }
+                        
+                        return `
+                            <div class="worker-item ${statusClass}">
+                                <div class="worker-header">
+                                    <div class="worker-id">
+                                        <div class="heartbeat-indicator ${heartbeatClass}"></div>
+                                        ${worker.worker_id}
+                                    </div>
+                                    <span style="font-size: 0.8rem; color: var(--text-secondary);">${statusText}</span>
+                                </div>
+                                <div class="heartbeat-info">
+                                    <div class="heartbeat-detail">
+                                        <span>Last Heartbeat:</span>
+                                        <span class="heartbeat-value">${formatTime(worker.last_seen_ago)}</span>
+                                    </div>
+                                    <div class="heartbeat-detail">
+                                        <span>Timestamp:</span>
+                                        <span class="heartbeat-value">${worker.heartbeat_timestamp}</span>
+                                    </div>
+                                    <div class="heartbeat-detail">
+                                        <span>Response:</span>
+                                        <span class="heartbeat-value">${worker.response_time_ms}ms</span>
+                                    </div>
+                                    <div class="heartbeat-detail">
+                                        <span>Status:</span>
+                                        <span class="heartbeat-value">${worker.status.toUpperCase()}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                } else {
+                    workerList.innerHTML = `
+                        <div style="text-align: center; color: var(--text-secondary); padding: 20px;">
+                            <div class="update-indicator">
+                                <div class="update-dot"></div>
+                                <span>No worker heartbeats detected</span>
+                            </div>
+                            <p style="margin-top: 8px; font-size: 0.9rem;">Start workers to see real-time heartbeat data</p>
+                        </div>
+                    `;
+                }
+                
+                // Update system status
+                const kafkaConnected = data.kafka_broker ? true : false;
+                document.getElementById('kafkaStatus').textContent = kafkaConnected ? '✓ Connected' : '✗ Disconnected';
+                document.getElementById('kafkaStatus').style.color = kafkaConnected ? 'var(--success)' : 'var(--error)';
+                
+                document.getElementById('redisStatus').textContent = data.redis_connected ? '✓ Connected' : '✗ Disconnected';
+                document.getElementById('redisStatus').style.color = data.redis_connected ? 'var(--success)' : 'var(--error)';
+                
+            } catch (error) {
+                console.error('Dashboard update error:', error);
+                // Show error state
+                document.getElementById('kafkaStatus').textContent = '✗ Error';
+                document.getElementById('kafkaStatus').style.color = 'var(--error)';
+                document.getElementById('redisStatus').textContent = '✗ Error';
+                document.getElementById('redisStatus').style.color = 'var(--error)';
+                
+                // Update heartbeat display with error state
+                document.getElementById('workerList').innerHTML = `
+                    <div style="text-align: center; color: var(--error); padding: 20px;">
+                        <div>⚠️ Connection Error</div>
+                        <p style="font-size: 0.9rem; margin-top: 8px;">Unable to fetch heartbeat data</p>
+                    </div>
+                `;
+            }
+        }
+
+        // Enhanced time formatting function
+        function formatTime(seconds) {
+            if (seconds < 1) return 'Just now';
+            if (seconds < 60) return `${Math.floor(seconds)}s ago`;
+            if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+            return `${Math.floor(seconds / 3600)}h ago`;
+        }
+
+        // Alert system
+        function showAlert(type, message) {
+            const alertContainer = document.getElementById('alertContainer');
+            const alert = document.createElement('div');
+            alert.className = `alert alert-${type}`;
+            alert.textContent = message;
+            
+            alertContainer.appendChild(alert);
+            
+            setTimeout(() => {
+                alert.style.opacity = '0';
+                setTimeout(() => alert.remove(), 300);
+            }, 5000);
+        }
+
+        // Initialize dashboard updates
+        updateDashboard();
+        setInterval(updateDashboard, 3000);
+    </script>
+</body>
+</html>

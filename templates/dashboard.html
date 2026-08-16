@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Worker Dashboard - Distributed Image Processing</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        
+        .header {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            color: #667eea;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            color: #666;
+            font-size: 1.1em;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: white;
+            padding: 25px;
+            border-radius: 15px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease;
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .stat-card h3 {
+            color: #888;
+            font-size: 0.9em;
+            text-transform: uppercase;
+            margin-bottom: 10px;
+        }
+        
+        .stat-value {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #667eea;
+        }
+        
+        .stat-label {
+            color: #999;
+            font-size: 0.9em;
+            margin-top: 5px;
+        }
+        
+        .workers-section {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        
+        .section-title {
+            color: #667eea;
+            font-size: 1.8em;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #f0f0f0;
+        }
+        
+        .worker-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        .worker-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+        
+        .worker-id {
+            font-size: 1.3em;
+            font-weight: bold;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+        }
+        
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #4ade80;
+            margin-right: 10px;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+        
+        .worker-info {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        
+        .info-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.2);
+        }
+        
+        .info-label {
+            opacity: 0.8;
+        }
+        
+        .info-value {
+            font-weight: bold;
+        }
+        
+        .no-workers {
+            text-align: center;
+            padding: 60px 20px;
+            color: #999;
+        }
+        
+        .no-workers-icon {
+            font-size: 4em;
+            margin-bottom: 20px;
+        }
+        
+        .refresh-info {
+            text-align: center;
+            color: #666;
+            margin-top: 20px;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+        
+        .back-button {
+            display: inline-block;
+            background: white;
+            color: #667eea;
+            padding: 12px 30px;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: bold;
+            transition: all 0.3s ease;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.1);
+        }
+        
+        .back-button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        
+        .system-status {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+            justify-content: center;
+        }
+        
+        .status-badge {
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: bold;
+        }
+        
+        .status-healthy {
+            background: #4ade80;
+            color: white;
+        }
+        
+        .status-warning {
+            background: #fbbf24;
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🖥 Worker Dashboard</h1>
+            <p>Real-time monitoring of distributed image processing workers</p>
+            <div class="system-status" id="systemStatus"></div>
+            <div style="margin-top: 20px;">
+                <a href="/" class="back-button">← Back to Upload</a>
+            </div>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-card">
+                <h3>Active Workers</h3>
+                <div class="stat-value" id="activeWorkers">-</div>
+                <div class="stat-label">Currently processing</div>
+            </div>
+            
+            <div class="stat-card">
+                <h3>Kafka Broker</h3>
+                <div class="stat-value" style="font-size: 1.5em;" id="kafkaBroker">-</div>
+                <div class="stat-label">Message broker</div>
+            </div>
+            
+            <div class="stat-card">
+                <h3>Operations</h3>
+                <div class="stat-value" id="operations">-</div>
+                <div class="stat-label">Available filters</div>
+            </div>
+            
+            <div class="stat-card">
+                <h3>System Status</h3>
+                <div class="stat-value" style="font-size: 1.5em;" id="systemHealth">-</div>
+                <div class="stat-label">Overall health</div>
+            </div>
+        </div>
+        
+        <div class="workers-section">
+            <h2 class="section-title">👷 Worker Nodes</h2>
+            <div class="worker-grid" id="workerGrid">
+                <div class="no-workers">
+                    <div class="no-workers-icon">⏳</div>
+                    <p>Loading worker information...</p>
+                </div>
+            </div>
+            <div class="refresh-info">
+                🔄 Auto-refreshing every 3 seconds
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function formatTime(seconds) {
+            if (seconds < 60) return Math.floor(seconds) + 's ago';
+            if (seconds < 3600) return Math.floor(seconds / 60) + 'm ago';
+            return Math.floor(seconds / 3600) + 'h ago';
+        }
+        
+        async function updateDashboard() {
+            try {
+                const response = await fetch('/dashboard/data');
+                const data = await response.json();
+                
+                // Update stats
+                document.getElementById('activeWorkers').textContent = data.active_workers;
+                document.getElementById('kafkaBroker').textContent = data.kafka_broker.split(':')[0];
+                document.getElementById('operations').textContent = data.operations_available;
+                
+                // Update system status
+                const healthBadge = data.redis_connected ? 
+                    '<span class="status-badge status-healthy">✓ Redis Online</span>' :
+                    '<span class="status-badge status-warning">⚠ Redis Offline</span>';
+                document.getElementById('systemStatus').innerHTML = healthBadge;
+                document.getElementById('systemHealth').textContent = data.redis_connected ? '✓ Healthy' : '⚠ Degraded';
+                document.getElementById('systemHealth').style.color = data.redis_connected ? '#4ade80' : '#fbbf24';
+                
+                // Update worker grid
+                const workerGrid = document.getElementById('workerGrid');
+                
+                if (data.worker_list.length === 0) {
+                    workerGrid.innerHTML = `
+                        <div class="no-workers">
+                            <div class="no-workers-icon">💤</div>
+                            <p style="font-size: 1.2em; margin-bottom: 10px;">No active workers</p>
+                            <p>Start worker nodes to begin processing</p>
+                        </div>
+                    `;
+                } else {
+                    workerGrid.innerHTML = data.worker_list.map(worker => `
+                        <div class="worker-card">
+                            <div class="worker-id">
+                                <span class="status-indicator"></span>
+                                ${worker.worker_id}
+                            </div>
+                            <div class="worker-info">
+                                <div class="info-row">
+                                    <span class="info-label">Status</span>
+                                    <span class="info-value">${worker.status.toUpperCase()}</span>
+                                </div>
+                                <div class="info-row">
+                                    <span class="info-label">Last Heartbeat</span>
+                                    <span class="info-value">${formatTime(worker.last_seen_ago)}</span>
+                                </div>
+                                <div class="info-row">
+                                    <span class="info-label">Timestamp</span>
+                                    <span class="info-value">${new Date(worker.last_seen * 1000).toLocaleTimeString()}</span>
+                                </div>
+                            </div>
+                        </div>
+                    `).join('');
+                }
+            } catch (error) {
+                console.error('Error updating dashboard:', error);
+                document.getElementById('systemHealth').textContent = '✗ Error';
+                document.getElementById('systemHealth').style.color = '#ef4444';
+            }
+        }
+        
+        // Initial load
+        updateDashboard();
+        
+        // Auto-refresh every 3 seconds
+        setInterval(updateDashboard, 3000);
+    </script>
+</body>
+</html>

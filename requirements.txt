@@ -1,0 +1,22 @@
+# requirements.txt - Python Dependencies (WITH CONFLUENT KAFKA)
+# Install with: pip install -r requirements.txt
+
+# Web Framework
+Flask==3.0.0
+Werkzeug==3.0.1
+
+# Kafka - Use Confluent Kafka API (not kafka-python)
+confluent-kafka==2.3.0
+
+# Redis - job state store on the master node
+redis==5.0.1
+
+# Image Processing
+opencv-python==4.8.1.78
+opencv-python-headless==4.8.1.78
+numpy==1.26.2
+
+# Utilities
+python-dotenv==1.0.0
+
+gunicorn==21.2.0
