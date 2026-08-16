@@ -1,0 +1,9 @@
+apiVersion: 1
+
+providers:
+  - name: DIP
+    folder: DIP
+    type: file
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards

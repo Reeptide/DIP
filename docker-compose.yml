@@ -1,0 +1,340 @@
+name: dip
+
+# Infrastructure + application services for the distributed image
+# processing pipeline.
+
+services:
+  # --------------------------------------------------------------------------
+  # Kafka - KRaft mode, single node acting as both broker and controller.
+  # Two listeners: `kafka:9092` for containers, `localhost:29092` for host
+  # tools (the benchmark harness runs on the host).
+  # --------------------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.9.1
+    container_name: dip-kafka
+    restart: unless-stopped
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      CLUSTER_ID: dip-cluster-0000000000001
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Rebalance immediately instead of waiting 3s - matters when scaling
+      # workers up and down during benchmarks.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Refuse to silently create topics with the wrong partition count.
+      # Topic creation is explicit, in kafka-init below.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+
+  # --------------------------------------------------------------------------
+  # Topic creation. Runs once, then exits.
+  # PARTITION_COUNT is the parallelism ceiling: a Kafka consumer group assigns
+  # whole partitions to consumers, so at most PARTITION_COUNT workers can be
+  # active at once. The original setup used 2, which capped the system at 2
+  # workers no matter how many were started.
+  # --------------------------------------------------------------------------
+  kafka-init:
+    image: apache/kafka:3.9.1
+    container_name: dip-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      PARTITION_COUNT: ${KAFKA_PARTITIONS:-12}
+    command: >
+      bash -c '
+        set -e
+        BS=kafka:9092
+        create() {
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$BS --create --if-not-exists \
+            --topic "$$1" --partitions "$$2" --replication-factor 1
+        }
+        create tasks       "$$PARTITION_COUNT"
+        create results     "$$PARTITION_COUNT"
+        create heartbeats  1
+        create tasks.dlq   1
+        create ml_tasks    "$$PARTITION_COUNT"
+        create ml_results  "$$PARTITION_COUNT"
+        echo "--- topics ---"
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$BS --describe
+      '
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # Redis - job and tile state.
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: dip-redis
+    restart: unless-stopped
+    ports:
+      # Host port 6380: 6379 is already taken by another project's Redis
+      # (pho2rec_redis) on this machine. Containers still talk to each other
+      # over the internal network on the default 6379 - only the host-facing
+      # port changes, so app config referencing REDIS_PORT=6379 is unaffected
+      # for anything running inside compose.
+      - "6380:6379"
+    command: redis-server --appendonly yes --save ""
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --------------------------------------------------------------------------
+  # MinIO - S3-compatible blob store for the claim-check pattern (Step 5).
+  # Tile bytes live here; Kafka carries only a pointer.
+  # Console UI: http://localhost:9001
+  # --------------------------------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    container_name: dip-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-dipadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-dipadmin123}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # --------------------------------------------------------------------------
+  # Bucket creation. Runs once, then exits.
+  # --------------------------------------------------------------------------
+  minio-init:
+    image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+    container_name: dip-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-dipadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-dipadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-dip-tiles}
+    entrypoint: >
+      /bin/sh -c '
+        set -e
+        mc alias set local http://minio:9000 "$$MINIO_ACCESS_KEY" "$$MINIO_SECRET_KEY"
+        mc mb --ignore-existing "local/$$MINIO_BUCKET"
+        echo "bucket ready: $$MINIO_BUCKET"
+      '
+    restart: "no"
+
+  # --------------------------------------------------------------------------
+  # Master - Flask UI, tiling, task dispatch, reconstruction.
+  #
+  # Horizontally scalable now (`docker compose up --scale master=N`), same
+  # pattern as `worker`: no `container_name` (Compose refuses to scale a
+  # service with a fixed one), no fixed INSTANCE_ID (app/config.py falls
+  # back to hostname, like WORKER_ID already did). HTTP routes are safe on
+  # every replica simultaneously (they only ever touch Redis/Kafka/MinIO,
+  # never in-process state) - `master-proxy` below round-robins across
+  # them. Background duties that are NOT safe to run N-times-over (the
+  # reaper, result consumers) self-gate on Redis-backed leader election
+  # instead - see app/leader.py.
+  # --------------------------------------------------------------------------
+  master:
+    build: .
+    restart: unless-stopped
+    command: ["master"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKER: kafka:9092
+      REDIS_HOST: redis
+      REDIS_PORT: 6379  # internal container port, unaffected by the 6380 host remap
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-dipadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-dipadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-dip-tiles}
+      # Overridable for bench/run_tile_size_sweep.py - see app/config.py for
+      # why 256 is the default (a measured result, not a guess).
+      TILE_SIZE: ${TILE_SIZE:-256}
+    expose:
+      - "5000"
+    volumes:
+      - ./uploads:/srv/uploads
+      - ./results:/srv/results
+
+  # --------------------------------------------------------------------------
+  # Master proxy - round-robins host port 5000 across every `master` replica
+  # via nginx's own DNS re-resolution of the Compose service name (same
+  # mechanism Prometheus's DNS service discovery relies on for `worker`).
+  # Not leader-aware and doesn't need to be: any master replica can safely
+  # answer any HTTP request, leadership only gates background duties.
+  # --------------------------------------------------------------------------
+  master-proxy:
+    image: nginx:1.27-alpine
+    container_name: dip-master-proxy
+    restart: unless-stopped
+    ports:
+      - "5000:80"
+    volumes:
+      - ./monitoring/nginx/master-proxy.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - master
+
+  # --------------------------------------------------------------------------
+  # Worker - one image, many replicas. `docker compose up --scale worker=N`
+  # is the whole point of Step 3: N is no longer capped by a hardcoded
+  # partition count, only by KAFKA_PARTITIONS (12 by default).
+  # --------------------------------------------------------------------------
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["worker"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKER: kafka:9092
+      # Added in Step 5: workers fetch/store tile bytes directly from
+      # MinIO now (the claim-check pattern). Missing here until this fix
+      # meant every worker fell back to app/config.py's localhost:9000
+      # default, which inside a worker container is the worker itself, not
+      # MinIO - tile fetches failed with connection-refused.
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-dipadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-dipadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-dip-tiles}
+      # WORKER_ID intentionally left unset: app/config.py falls back to
+      # worker-{hostname}, and each scaled replica gets a distinct
+      # container hostname automatically - no per-replica config needed.
+    expose:
+      # Not `ports` - a scaled service can't publish a fixed host port (all
+      # replicas would collide on it). Prometheus reaches this over the
+      # internal network via DNS service discovery (see
+      # monitoring/prometheus/prometheus.yml), which needs the port
+      # reachable on the network but not published to the host.
+      - "9200"
+
+  # --------------------------------------------------------------------------
+  # ML inference - object detection (YOLOv8n) + classification (MobileNetV2).
+  # Separate consumer group from `worker`, subscribed to ml_tasks/ml_results
+  # instead of tasks/results.
+  #
+  # GPU is enabled (INFERENCE_USE_GPU=true plus the `deploy` reservation
+  # below - Compose needs both: the env var is what inference/engine.py
+  # gates on, the reservation is what actually exposes the device).
+  #
+  # This was previously force-disabled because GPU runs intermittently hung
+  # under sustained load (100%+ CPU across many threads, zero forward
+  # progress, no exception, clearing on its own). That turned out to be
+  # driver-side PTX JIT: this host's RTX 5050 is Blackwell/sm_120 and
+  # onnxruntime-gpu 1.19.2 ships no sm_120 code, only compute_80 PTX.
+  # requirements.txt now pins onnxruntime-gpu 1.28.0 (CUDA 13 build, native
+  # sm_120 cubins) with the CUDA/cuDNN versions its own extras declare - see
+  # the comment block there. Falling back to CPU is a two-line revert: set
+  # INFERENCE_USE_GPU to "false" and comment the `deploy` block back out.
+  #
+  # Requires: `python scripts/download_model.py` run once first (models are
+  # not baked into the image - see .gitignore, same reasoning as the
+  # uploads/results runtime images never being committed).
+  # --------------------------------------------------------------------------
+  inference:
+    build: .
+    restart: unless-stopped
+    command: ["inference"]
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BROKER: kafka:9092
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-dipadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-dipadmin123}
+      MINIO_BUCKET: ${MINIO_BUCKET:-dip-tiles}
+      INFERENCE_USE_GPU: "true"
+    volumes:
+      - ./models:/srv/models:ro
+    expose:
+      - "9200"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # --------------------------------------------------------------------------
+  # Prometheus - scrapes master's /metrics (static target) plus worker and
+  # inference (DNS service discovery, since --scale gives each replica a
+  # distinct IP with no static port mapping - see monitoring/prometheus).
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    container_name: dip-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+
+  # --------------------------------------------------------------------------
+  # Grafana - dashboard provisioned in-repo (monitoring/grafana), datasource
+  # pre-wired to prometheus:9090 so there's no manual setup after `up`.
+  # --------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.1.4
+    container_name: dip-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  kafka-data:
+  redis-data:
+  minio-data:
+  prometheus-data:
+  grafana-data:

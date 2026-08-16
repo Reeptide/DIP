@@ -1,0 +1,116 @@
+{
+  "title": "DIP Overview",
+  "uid": "dip-overview",
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Throughput (tiles/sec, by pipeline)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(dip_tiles_processed_total{status=\"success\"}[1m])) by (pipeline)",
+          "legendFormat": "{{pipeline}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "p99 tile latency, by pipeline",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(dip_tile_processing_seconds_bucket[1m])) by (le, pipeline))",
+          "legendFormat": "{{pipeline}} p99"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(dip_tile_processing_seconds_bucket[1m])) by (le, pipeline))",
+          "legendFormat": "{{pipeline}} p50"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Per-worker load balance (OpenCV pipeline, tiles/sec)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "description": "One series per worker replica (Prometheus 'instance' label = replica IP:9200 via DNS service discovery). Even lines confirm partitions are spread evenly across replicas, per Step 3.",
+      "targets": [
+        {
+          "expr": "sum(rate(dip_tiles_processed_total{pipeline=\"opencv\", status=\"success\"}[1m])) by (instance)",
+          "legendFormat": "{{instance}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "DLQ tiles (cumulative) and reaper requeues",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "description": "dip_dlq_depth is the real, live message count on tasks.dlq (Kafka high-watermark minus low-watermark, polled every 5s by master/dlq_monitor.py - no consumer needed). dip_dlq_total is cumulative (a Counter, only ever grows) and dip_tiles_requeued_total tracks the reaper's own requeue attempts, which is a different number from DLQ depth - a requeue that succeeds never reaches the DLQ at all.",
+      "targets": [
+        {
+          "expr": "dip_dlq_depth",
+          "legendFormat": "DLQ depth (live)"
+        },
+        {
+          "expr": "sum(dip_dlq_total) by (pipeline)",
+          "legendFormat": "DLQ total ({{pipeline}}, cumulative)"
+        },
+        {
+          "expr": "dip_tiles_requeued_total",
+          "legendFormat": "reaper requeues total"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Active workers",
+      "type": "stat",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "dip_active_workers" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Inference in-process queue depth",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 9, "x": 6, "y": 16 },
+      "description": "Tasks buffered in inference/main.py waiting for a batch slot. Sustained growth means backpressure (consumer.pause()) is about to engage.",
+      "targets": [
+        { "expr": "dip_queue_depth{pipeline=\"ml\"}", "legendFormat": "ml pending queue" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Jobs finished, by status",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 9, "x": 15, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(rate(dip_jobs_finished_total[5m])) by (pipeline, status)",
+          "legendFormat": "{{pipeline}} {{status}}"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Master replicas and current leader",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 22 },
+      "description": "One line per master replica (app/leader.py's Redis-backed election, docker compose up --scale master=N). Exactly one should read 1 at any moment - a gap where all lines are 0 (or the sum drops below 1) means a leader handoff is in progress, expected to self-heal within ~2s (the lock's TTL).",
+      "targets": [
+        { "expr": "dip_is_leader", "legendFormat": "{{instance}}" },
+        { "expr": "sum(dip_is_leader)", "legendFormat": "sum (should always be 1)" }
+      ]
+    }
+  ]
+}

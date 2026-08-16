@@ -1,0 +1,3 @@
+worker_count,image_name,width,height,tile_count,operation,wall_clock_s,tiles_per_sec,p50_ms,p95_ms,p99_ms,avg_tile_kb,total_kb_in
+1,large,6144,6144,144,edge_canny,4.554,31.62,19.54,35.09,38.67,0.23,33.68
+8,large,6144,6144,144,edge_canny,2.725,52.85,42.82,63.29,67.69,0.23,33.68

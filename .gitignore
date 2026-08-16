@@ -4,6 +4,11 @@ results/*
 !uploads/.gitkeep
 !results/.gitkeep
 
+# ONNX model weights - downloaded by scripts/download_model.py, not source.
+# yolov8n.onnx is ~13MB, mobilenetv2 ~14MB - real binary weights don't
+# belong in git any more than the uploads/results images did.
+models/*.onnx
+
 # Python
 __pycache__/
 *.py[cod]

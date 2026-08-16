@@ -1,0 +1,40 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  # Master is horizontally scalable now (`docker compose up --scale
+  # master=N`, see app/leader.py) - a static target would only ever scrape
+  # whichever single replica IP Compose's DNS happened to resolve first,
+  # silently missing every other replica. DNS service discovery, same
+  # pattern as worker/inference below. Serves /metrics as a Flask route
+  # (master/app.py) on its normal port rather than a separate one, since it
+  # already runs an HTTP server.
+  - job_name: dip-master
+    metrics_path: /metrics
+    dns_sd_configs:
+      - names: ["master"]
+        type: A
+        port: 5000
+        refresh_interval: 5s
+
+  # worker and inference are scaled (`docker compose up --scale worker=N`),
+  # so each replica gets a distinct container IP with no static port mapping
+  # - there's no fixed target list to write. Compose's embedded DNS (at
+  # 127.0.0.11 inside every container on the network) resolves a service
+  # name to one A record per running replica, which is exactly what
+  # dns_sd_configs polls. This is why worker/inference expose a fixed
+  # internal port (9200) via `expose` in docker-compose.yml instead of a
+  # host `ports` mapping - only Prometheus needs to reach it, not the host.
+  - job_name: dip-worker
+    dns_sd_configs:
+      - names: ["worker"]
+        type: A
+        port: 9200
+        refresh_interval: 5s
+
+  - job_name: dip-inference
+    dns_sd_configs:
+      - names: ["inference"]
+        type: A
+        port: 9200
+        refresh_interval: 5s

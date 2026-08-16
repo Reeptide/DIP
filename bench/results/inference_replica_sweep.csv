@@ -1,0 +1,5 @@
+replica_count,tile_count,status,wall_clock_s,tiles_per_sec,p50_ms,p95_ms,p99_ms
+1,144,completed,37.927,3.8,238.51,297.22,297.22
+2,144,completed,22.142,6.5,280.7,319.9,319.9
+4,144,completed,15.614,9.22,360.5,395.68,431.97
+8,144,completed,12.893,11.17,446.57,592.47,661.44

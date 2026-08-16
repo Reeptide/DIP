@@ -1,0 +1,11 @@
+# Slim dependency set for `pytest tests/` (CI and local). Deliberately
+# excludes Kafka/MinIO/Flask/onnxruntime-gpu from requirements.txt - tests/
+# only exercises app/imaging.py, app/ops.py, and app/jobstore.py, none of
+# which touch Kafka, MinIO, Flask, or ONNX. Installing the full
+# requirements.txt in CI would pull multi-GB CUDA wheels for tests that
+# never import them.
+opencv-python-headless==4.8.1.78
+numpy==1.26.2
+redis==5.0.1
+pytest==8.3.3
+testcontainers[redis]==4.8.1

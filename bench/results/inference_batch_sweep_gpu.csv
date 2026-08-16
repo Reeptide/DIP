@@ -1,0 +1,5 @@
+batch_size,tile_count,status,wall_clock_s,tiles_per_sec,p50_ms,p95_ms,p99_ms
+1,144,completed,5.783,24.9,28.18,34.3,94.95
+8,144,completed,10.65,13.52,20.58,78.27,85.97
+16,144,completed,10.386,13.86,19.46,56.5,56.5
+32,144,completed,11.401,12.63,26.63,36.82,36.82
