@@ -67,7 +67,19 @@ class ImageProcessor:
         sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
         sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
         sobel = np.sqrt(sobelx ** 2 + sobely ** 2)
-        sobel = np.uint8(255 * sobel / np.max(sobel))
+        # A solid-color tile (sky, letterboxing, a scanned margin - all
+        # common in real images) has zero gradient everywhere, so
+        # np.max(sobel) is 0: the old unconditional divide produced NaN,
+        # then np.uint8(NaN) is undefined behavior in NumPy (it happened to
+        # come out 0 on this build, but that's not guaranteed by anything).
+        # Found during a full-project review, reproduced directly against a
+        # solid-color tile. A zero-max tile has no edges by definition, so
+        # skip the normalization and return the all-zero result directly.
+        max_val = np.max(sobel)
+        if max_val == 0:
+            sobel = np.zeros_like(sobel, dtype=np.uint8)
+        else:
+            sobel = np.uint8(255 * sobel / max_val)
         return cv2.cvtColor(sobel, cv2.COLOR_GRAY2BGR)
 
     @staticmethod

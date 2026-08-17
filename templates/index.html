@@ -1135,11 +1135,11 @@
                                 <span class="summary-value" id="orphanedKeys">0</span>
                             </div>
                             <div class="summary-row">
-                                <span class="summary-label">Status Keys:</span>
+                                <span class="summary-label">Tile Tracking Keys:</span>
                                 <span class="summary-value" id="statusKeys">0</span>
                             </div>
                             <div class="summary-row">
-                                <span class="summary-label">Result Keys:</span>
+                                <span class="summary-label">Job Keys:</span>
                                 <span class="summary-value" id="resultKeys">0</span>
                             </div>
                             <div class="summary-row">
@@ -1360,13 +1360,27 @@
             loadMetadata();
         });
 
+        // Admin routes (cleanup/clear) are gated server-side behind
+        // ADMIN_TOKEN (master/admin_routes.py's require_admin_token) and
+        // disabled entirely if it's unset - found during a full-project
+        // review that these buttons were calling the routes with no
+        // X-Admin-Token header at all, so they 401'd/503'd even when the
+        // token was configured. Prompted at click time rather than stored
+        // anywhere in the page, since this template is server-rendered and
+        // shouldn't embed the secret for every visitor.
+        function promptAdminToken() {
+            return window.prompt('Admin token (X-Admin-Token) for this action:');
+        }
+
         // NEW: Cleanup orphaned keys functionality
         document.getElementById('cleanupOrphaned').addEventListener('click', async () => {
+            const adminToken = promptAdminToken();
+            if (!adminToken) return;
             try {
                 // First, do a dry run
                 const dryResponse = await fetch('/metadata/cleanup', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': adminToken },
                     body: JSON.stringify({ dry_run: true })
                 });
                 
@@ -1390,7 +1404,7 @@
                         // Actually do the cleanup
                         const cleanupResponse = await fetch('/metadata/cleanup', {
                             method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
+                            headers: { 'Content-Type': 'application/json', 'X-Admin-Token': adminToken },
                             body: JSON.stringify({ dry_run: false })
                         });
                         
@@ -1422,10 +1436,12 @@
         // Clear old jobs
         document.getElementById('clearOldJobs').addEventListener('click', async () => {
             if (confirm('Clear jobs older than 24 hours?\n\nThis will remove:\n• Job data and metadata\n• Associated tiles and results\n• Processing history\n\nThis action cannot be undone.')) {
+                const adminToken = promptAdminToken();
+                if (!adminToken) return;
                 try {
                     const response = await fetch('/metadata/clear', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
+                        headers: { 'Content-Type': 'application/json', 'X-Admin-Token': adminToken },
                         body: JSON.stringify({ older_than_hours: 24 })
                     });
                     
@@ -1472,8 +1488,14 @@
             
             // Update cleanup info
             document.getElementById('orphanedKeys').textContent = data.redis_summary.orphaned_keys || 0;
-            document.getElementById('statusKeys').textContent = data.redis_summary.status_keys || 0;
-            document.getElementById('resultKeys').textContent = data.redis_summary.result_keys || 0;
+            // Renamed from the old "Status/Result Keys" labels, which
+            // /metadata (master/admin_routes.py) has never returned fields
+            // for since the Redis-hash refactor - those two counters
+            // silently always showed 0 (masked by `|| 0`). Found during a
+            // full-project review. tile_keys/job_keys are what the
+            // endpoint actually reports.
+            document.getElementById('statusKeys').textContent = data.redis_summary.tile_keys || 0;
+            document.getElementById('resultKeys').textContent = data.redis_summary.job_keys || 0;
             document.getElementById('counterKeys').textContent = data.redis_summary.counter_keys || 0;
             
             // Show cleanup warning if needed

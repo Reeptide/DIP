@@ -150,6 +150,19 @@ def upload_and_wait(image, operation, timeout=JOB_TIMEOUT_S):
     # Step 6 moved this to a top-level field (a Redis LIST, not embedded in
     # the job hash) - see app/jobstore.py.
     tile_latencies_ms = [t * 1000 for t in status.get('tile_latencies_s', [])]
+
+    # Not timed (measured throughput is about the tile pipeline, not
+    # reconstruction) but not optional either: /reconstruct is the only
+    # thing that calls delete_job_tiles() on the OpenCV path
+    # (master/app.py) - skipping it, as this script always did, leaked
+    # every tile's MinIO blobs permanently on every sweep. Found during a
+    # full-project review; the leak was in the exact benchmark run that
+    # regenerated README.md's speedup chart.
+    try:
+        requests.post(f"{MASTER_URL}/reconstruct/{job_id}", timeout=30).raise_for_status()
+    except requests.RequestException as e:
+        print(f"  warning: reconstruct cleanup failed for job {job_id}: {e}")
+
     return wall_clock_s, tile_latencies_ms, tiles_count
 
 

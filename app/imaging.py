@@ -12,6 +12,7 @@ so there is no longer a reason to pay base64's ~33% size overhead anywhere
 in the pipeline.
 """
 import logging
+import struct
 
 import cv2
 import numpy as np
@@ -19,6 +20,55 @@ import numpy as np
 from app.config import TILE_SIZE, MAX_TILES
 
 logger = logging.getLogger(__name__)
+
+
+def probe_image_dimensions(data: bytes):
+    """Read width/height straight from a PNG/JPEG/BMP header, without
+    decoding pixels. Used to reject oversized images BEFORE cv2.imread()
+    allocates a full pixel buffer - found during a full-project review:
+    the upload routes were checking MAX_IMAGE_DIMENSION only after the
+    decode already happened, so a small, highly-compressed file at e.g.
+    32000x32000 could force a multi-GB allocation before any size check
+    ran. Returns (width, height), or None if the format isn't recognized
+    or the header is too short/malformed to read - callers should fall
+    back to letting cv2.imread() itself reject the file in that case.
+    """
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        if len(data) < 24:
+            return None
+        width, height = struct.unpack('>II', data[16:24])
+        return width, height
+
+    if data[:2] == b'\xff\xd8':
+        pos = 2
+        while pos + 4 <= len(data):
+            if data[pos] != 0xFF:
+                pos += 1
+                continue
+            marker = data[pos + 1]
+            # SOFn markers (0xC0-0xCF except the DHT/JPG-ext/DAC markers
+            # C4, C8, CC) carry the frame's dimensions.
+            if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                if pos + 9 > len(data):
+                    return None
+                height, width = struct.unpack('>HH', data[pos + 5:pos + 9])
+                return width, height
+            if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                pos += 2
+                continue
+            if pos + 4 > len(data):
+                return None
+            seg_len = struct.unpack('>H', data[pos + 2:pos + 4])[0]
+            pos += 2 + seg_len
+        return None
+
+    if data[:2] == b'BM':
+        if len(data) < 26:
+            return None
+        width, height = struct.unpack('<ii', data[18:26])
+        return width, abs(height)
+
+    return None
 
 
 def tile_geometries(width, height, tile_size=TILE_SIZE):

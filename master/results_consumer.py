@@ -83,6 +83,20 @@ def listen_for_results():
         logger.warning("Acquired leadership - starting result consumption")
         consumer_config = master_consumer_conf()
         consumer_config['group.id'] = RESULT_CONSUMER_GROUP
+        # Manual commit, overriding master_consumer_conf()'s default
+        # enable.auto.commit=True (fine for the monitoring-only consumers
+        # it was designed for - heartbeats, DLQ depth - but wrong here).
+        # Auto-commit advances offsets on a timer, independent of whether
+        # _process_message() actually succeeded - so a result that was
+        # fetched but not yet processed could already be committed when a
+        # leadership handoff happens, silently dropping it rather than
+        # replaying it on the new leader. That directly contradicted this
+        # module's own docstring claim about clean failover continuation;
+        # found during a full-project review. record_tile_result() is
+        # idempotent, so committing only after a successful process is
+        # safe even under at-least-once redelivery from a slow/failed
+        # commit.
+        consumer_config['enable.auto.commit'] = False
         consumer = Consumer(consumer_config)
         consumer.subscribe([RESULT_TOPIC])
 
@@ -100,6 +114,13 @@ def listen_for_results():
 
                 try:
                     _process_message(msg)
+                    # Async, not sync - see inference/main.py's
+                    # _drain_commits for why: a synchronous commit blocks
+                    # until the broker acks, and if that takes long enough
+                    # this loop stops calling poll() for the same stretch,
+                    # risking a session-timeout eviction from the consumer
+                    # group (silent - no crash, just a new member ID).
+                    consumer.commit(message=msg, asynchronous=True)
                 except json.JSONDecodeError as e:
                     logger.error(f"Invalid JSON in result: {e}")
                 except Exception as e:

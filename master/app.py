@@ -10,16 +10,13 @@ regenerated templates/dashboard.html from an inline HTML string on every
 master startup, silently overwriting the checked-in template file. The
 template is tracked in git now and edited directly.
 """
-import json
 import logging
 import os
 import signal
 import threading
 import time
 import uuid
-from collections import defaultdict
 from datetime import datetime
-from functools import wraps
 
 import cv2
 from flask import Flask, render_template, request, jsonify, send_file, Response
@@ -31,10 +28,10 @@ from app.config import (
     KAFKA_BROKER, REDIS_HOST, REDIS_PORT, INSTANCE_ID,
     UPLOAD_FOLDER, RESULT_FOLDER, ALLOWED_EXTENSIONS,
     TILE_SIZE, MIN_IMAGE_SIZE, MAX_IMAGE_DIMENSION, MAX_TILES,
-    HEARTBEAT_TIMEOUT, RATE_LIMIT, RATE_WINDOW, BATCH_SIZE,
+    HEARTBEAT_TIMEOUT, BATCH_SIZE,
     configure_logging,
 )
-from app.imaging import split_image_into_tiles, reconstruct_image_from_tiles
+from app.imaging import split_image_into_tiles, reconstruct_image_from_tiles, probe_image_dimensions
 from app.jobstore import (
     redis_client, create_job, get_job, mark_job_completed,
     get_tile_results, get_tile_latencies_ms, delete_job_tile_state,
@@ -50,6 +47,7 @@ from master.heartbeat import heartbeat_tracker, monitor_heartbeats
 from master.ml_results_consumer import listen_for_ml_results
 from master.ml_routes import ml_bp
 from master.publisher import publish_tile_tasks
+from master.rate_limit import rate_limit
 from master.reaper import run_reaper
 from master.results_consumer import listen_for_results
 
@@ -82,26 +80,9 @@ app.register_blueprint(ml_bp)
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['RESULT_FOLDER'], exist_ok=True)
 
-# ============================================================================
-# RATE LIMITING
-# ============================================================================
-request_counts = defaultdict(list)
-
-
-def rate_limit(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        ip = request.remote_addr
-        now = time.time()
-        request_counts[ip] = [t for t in request_counts[ip] if now - t < RATE_WINDOW]
-
-        if len(request_counts[ip]) >= RATE_LIMIT:
-            return jsonify({'error': 'Rate limit exceeded. Please try again later.'}), 429
-
-        request_counts[ip].append(now)
-        return f(*args, **kwargs)
-
-    return decorated_function
+# Rate limiting: see master/rate_limit.py (its own module so
+# master/ml_routes.py can use the same decorator without a circular
+# import - master/app.py already imports ml_bp FROM ml_routes.py).
 
 
 # ============================================================================
@@ -145,6 +126,22 @@ def upload_image():
 
         file.save(filepath)
 
+        # Probe dimensions from the header BEFORE cv2.imread() decodes
+        # pixels - a small, highly-compressed file can claim a huge
+        # resolution, and imread() would allocate the full pixel buffer
+        # (potentially multiple GB) before the MAX_IMAGE_DIMENSION check
+        # below ever ran. probe_image_dimensions() returns None on an
+        # unrecognized/malformed header, in which case imread() below is
+        # left to reject the file the way it always did.
+        with open(filepath, 'rb') as f:
+            header = f.read(65536)
+        probed = probe_image_dimensions(header)
+        if probed and (probed[0] > MAX_IMAGE_DIMENSION or probed[1] > MAX_IMAGE_DIMENSION):
+            os.remove(filepath)
+            return jsonify({
+                'error': f'Image too large. Maximum dimension: {MAX_IMAGE_DIMENSION}px'
+            }), 400
+
         image = cv2.imread(filepath)
         if image is None:
             os.remove(filepath)
@@ -172,6 +169,10 @@ def upload_image():
 
         expected_tiles = len(tiles)
 
+        # image is already decoded into memory (line 129) and tiled from
+        # there - the on-disk upload is never read again on this path.
+        os.remove(filepath)
+
         create_job(
             job_id,
             original_filename=filename,
@@ -180,6 +181,7 @@ def upload_image():
             original_height=height,
             expected_tiles=expected_tiles,
             active_workers=len(active_workers),
+            tile_size=TILE_SIZE,
         )
 
         success = publish_tile_tasks(job_id, tiles, operation, BATCH_SIZE)
@@ -384,12 +386,18 @@ def health():
         active_workers = heartbeat_tracker.get_active_workers()
         redis_healthy = redis_client.ping()
 
+        # producer_pool.get_producer() alone never proves anything -
+        # confluent_kafka.Producer() doesn't connect eagerly, so this
+        # returned a truthy object (and reported "healthy") even against a
+        # broker that was never reachable at all. list_topics() actually
+        # talks to the broker and raises on failure - a real check, found
+        # missing during a full-project review.
         kafka_healthy = False
         try:
-            if producer_pool.get_producer():
-                kafka_healthy = True
-        except Exception:
-            pass
+            producer_pool.get_producer().list_topics(timeout=5)
+            kafka_healthy = True
+        except Exception as e:
+            logger.warning(f"Kafka health check failed: {e}")
 
         overall_status = 'healthy' if (redis_healthy and kafka_healthy) else 'degraded'
 
@@ -412,12 +420,8 @@ def health():
 # ============================================================================
 # GRACEFUL SHUTDOWN
 # ============================================================================
-shutdown_event = threading.Event()
-
-
 def signal_handler(signum, frame):
     logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-    shutdown_event.set()
     try:
         producer_pool.cleanup()
     except Exception as e:
@@ -441,8 +445,13 @@ def validate_config():
         errors.append("KAFKA_BROKER not configured")
     else:
         try:
+            # Producer() doesn't connect eagerly and flush() on an empty
+            # queue returns immediately regardless of broker reachability -
+            # this "test" always passed, even against an unreachable
+            # broker, until list_topics() (which actually round-trips to
+            # the broker) replaced it. Found during a full-project review.
             test_producer = Producer({'bootstrap.servers': KAFKA_BROKER})
-            test_producer.flush(timeout=5)
+            test_producer.list_topics(timeout=5)
             logger.info("Kafka connectivity test passed")
         except Exception as e:
             errors.append(f"Cannot connect to Kafka at {KAFKA_BROKER}: {str(e)}")
@@ -530,7 +539,20 @@ def main():
     logger.info("=" * 80)
 
     try:
-        # In production, use Gunicorn/uWSGI instead of the dev server.
+        # This IS what actually runs in the shipped image, not a
+        # placeholder - `gunicorn` sat unused in requirements.txt claiming
+        # otherwise (found during a full-project review; removed it there
+        # rather than switch WSGI servers here, which isn't a drop-in
+        # change: gunicorn's default worker model forks separate OS
+        # processes, and this module starts background threads - the
+        # reaper, leader election, result consumers - at import time,
+        # before app.run() - each forked worker would independently
+        # restart all of them, multiplying exactly the kind of
+        # concurrent-duty problem app/leader.py's election exists to
+        # prevent, just within one container instead of across replicas).
+        # debug=False is what keeps this reasonably production-safe as-is;
+        # threaded=True lets it serve overlapping requests without a
+        # separate WSGI layer.
         app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
     except KeyboardInterrupt:
         logger.info("Received keyboard interrupt")

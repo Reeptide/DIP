@@ -182,6 +182,12 @@ services:
       # Overridable for bench/run_tile_size_sweep.py - see app/config.py for
       # why 256 is the default (a measured result, not a guess).
       TILE_SIZE: ${TILE_SIZE:-256}
+      # Unset (the default here) leaves the /metadata/cleanup,
+      # /metadata/nuclear-cleanup, and /metadata/clear routes disabled -
+      # see require_admin_token() in master/admin_routes.py. Set ADMIN_TOKEN
+      # in .env to enable them; the UI's cleanup buttons prompt for it at
+      # click time rather than embedding it in the page.
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
     expose:
       - "5000"
     volumes:
@@ -247,19 +253,17 @@ services:
   # Separate consumer group from `worker`, subscribed to ml_tasks/ml_results
   # instead of tasks/results.
   #
-  # GPU is enabled (INFERENCE_USE_GPU=true plus the `deploy` reservation
-  # below - Compose needs both: the env var is what inference/engine.py
-  # gates on, the reservation is what actually exposes the device).
-  #
-  # This was previously force-disabled because GPU runs intermittently hung
-  # under sustained load (100%+ CPU across many threads, zero forward
-  # progress, no exception, clearing on its own). That turned out to be
-  # driver-side PTX JIT: this host's RTX 5050 is Blackwell/sm_120 and
-  # onnxruntime-gpu 1.19.2 ships no sm_120 code, only compute_80 PTX.
-  # requirements.txt now pins onnxruntime-gpu 1.28.0 (CUDA 13 build, native
-  # sm_120 cubins) with the CUDA/cuDNN versions its own extras declare - see
-  # the comment block there. Falling back to CPU is a two-line revert: set
-  # INFERENCE_USE_GPU to "false" and comment the `deploy` block back out.
+  # CPU by default (INFERENCE_USE_GPU defaults to "false" in app/config.py,
+  # and inference/engine.py falls back to CPUExecutionProvider even when
+  # it's true and CUDA isn't available) - so the plain quickstart works on
+  # any machine. GPU is opt-in via docker-compose.gpu.yml, which layers in
+  # INFERENCE_USE_GPU=true plus the `deploy` device reservation Compose
+  # needs to actually expose the device: `docker compose -f docker-compose.yml
+  # -f docker-compose.gpu.yml up -d`. A bare `deploy.reservations.devices`
+  # block in this base file made Compose fail to even start the container
+  # on a host with no nvidia GPU, regardless of what INFERENCE_USE_GPU said -
+  # see docker-compose.gpu.yml for the GPU-specific notes (driver version,
+  # onnxruntime-gpu pin, the sm_120 PTX JIT issue this host hit).
   #
   # Requires: `python scripts/download_model.py` run once first (models are
   # not baked into the image - see .gitignore, same reasoning as the
@@ -280,18 +284,10 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-dipadmin}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-dipadmin123}
       MINIO_BUCKET: ${MINIO_BUCKET:-dip-tiles}
-      INFERENCE_USE_GPU: "true"
     volumes:
       - ./models:/srv/models:ro
     expose:
       - "9200"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
 
   # --------------------------------------------------------------------------
   # Prometheus - scrapes master's /metrics (static target) plus worker and

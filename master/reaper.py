@@ -39,7 +39,7 @@ import time
 
 from confluent_kafka import Producer
 
-from app.blobstore import tile_exists
+from app.blobstore import tile_exists, delete_job_tiles
 from app.leader import is_leader
 from app.metrics import tiles_requeued_total, jobs_finished_total
 from app.config import (
@@ -50,6 +50,7 @@ from app.imaging import tile_geometries
 from app.jobstore import (
     get_job, get_tile_results, get_last_reap_time, incr_tile_attempts,
     scan_job_ids, set_job_status, set_last_reap_time,
+    add_abandoned_tile, get_abandoned_tiles,
 )
 from app.kafkaio import master_producer_conf
 
@@ -115,11 +116,26 @@ def _republish_tile(producer, job_id, operation, geom, attempt):
 
 
 def reap_once(producer):
-    """One sweep over all jobs. Returns the number of tiles requeued."""
+    """One sweep over all jobs. Returns the number of tiles requeued.
+
+    Leadership is re-checked before EACH job, not just once before the loop
+    starts - a sweep over many jobs (each doing a MinIO stat_object call, a
+    producer.flush(), Redis writes) can outlive a leadership handoff, and
+    without this a former leader could keep doing reaper work - including
+    incr_tile_attempts(), which two concurrent reapers touching the same
+    tile is exactly the correctness bug leader election exists to prevent
+    (see app/leader.py's module docstring) - for a real, non-negligible
+    window after actually losing the lock.
+    """
     now = time.time()
     requeued = 0
 
     for job_id in scan_job_ids():
+        if not is_leader():
+            logger.warning("Lost leadership mid-sweep - stopping rather than "
+                            "risk reaping under a lock we may no longer hold")
+            break
+
         try:
             job_data = get_job(job_id)
             if not job_data or job_data['status'] != REAPABLE_STATUS:
@@ -140,44 +156,78 @@ def reap_once(producer):
                 # for the reaper to do.
                 continue
 
+            abandoned = get_abandoned_tiles(job_id)
+            retryable = [t for t in missing if t not in abandoned]
+
+            if not retryable:
+                # Every currently-missing tile has already been permanently
+                # given up on in a PRIOR pass - nothing left that could ever
+                # complete this job, so only now is it actually correct to
+                # call it degraded. This used to flip to degraded the
+                # instant ANY tile exceeded its attempt cap in a SINGLE
+                # pass, even when other tiles from that same pass were
+                # simultaneously being successfully re-queued - discarding
+                # their in-flight recovery for no reason, since a degraded
+                # job's tiles are excluded from all future reaper scans and
+                # from the results consumer's completion check.
+                set_job_status(job_id, 'degraded')
+                pipeline = 'ml' if job_data['operation'] == 'object_detection' else 'opencv'
+                jobs_finished_total.labels(pipeline=pipeline, status='degraded').inc()
+                logger.error(f"Job {job_id[:8]} marked DEGRADED - all {len(missing)} outstanding "
+                             f"tile(s) {sorted(missing)} are permanently unrecoverable")
+
+                # A degraded job never reaches /reconstruct (OpenCV) or the
+                # results-consumer completion branch (ML) - both are the
+                # only other places that sweep MinIO blobs, so without this
+                # a degraded job's blobs (task/result for OpenCV, ml_task
+                # for ML) leaked forever. Safe to sweep everything, not
+                # just the abandoned tiles' blobs: no code path produces
+                # partial reconstruction for a degraded job, so a
+                # successfully-processed tile's blob is exactly as
+                # unreachable as an abandoned one once the job is terminal.
+                delete_job_tiles(job_id)
+                continue
+
+            # Job's own tile_size, not the process's current TILE_SIZE
+            # default - they can differ (TILE_SIZE is runtime-configurable,
+            # see app/config.py) and using the wrong one silently produces a
+            # different tile_id layout than what was actually dispatched.
             geometries = {
                 g['tile_id']: g for g in
-                tile_geometries(job_data['original_width'], job_data['original_height'])
+                tile_geometries(job_data['original_width'], job_data['original_height'],
+                                 tile_size=job_data['tile_size'])
             }
 
-            logger.warning(f"Job {job_id[:8]} has {len(missing)} tile(s) outstanding after "
-                           f"{now - last_activity:.0f}s: {missing[:10]}")
+            logger.warning(f"Job {job_id[:8]} has {len(retryable)} tile(s) outstanding after "
+                           f"{now - last_activity:.0f}s: {retryable[:10]}")
 
-            gave_up = []
-            for tile_id in missing:
+            for tile_id in retryable:
                 attempt = incr_tile_attempts(job_id, tile_id) + 1  # original dispatch was attempt 1
                 if attempt > MAX_TILE_ATTEMPTS:
-                    gave_up.append(tile_id)
+                    add_abandoned_tile(job_id, tile_id)
+                    logger.error(f"Job {job_id[:8]} tile {tile_id} exceeded "
+                                 f"{MAX_TILE_ATTEMPTS} attempts - abandoned")
                     continue
 
                 geom = geometries.get(tile_id)
                 if geom is None:
-                    # expected_tiles and the recomputed layout disagree, which
-                    # would mean TILE_SIZE changed under a live job.
-                    logger.error(f"Job {job_id[:8]} tile {tile_id} has no geometry - skipping")
-                    gave_up.append(tile_id)
+                    # expected_tiles and the recomputed layout disagree -
+                    # would mean the stored tile_size and original
+                    # dimensions no longer produce the same tile count,
+                    # which shouldn't happen now that tile_size is
+                    # job-specific, but fail safe rather than crash.
+                    logger.error(f"Job {job_id[:8]} tile {tile_id} has no geometry - abandoned")
+                    add_abandoned_tile(job_id, tile_id)
                     continue
 
                 if _republish_tile(producer, job_id, job_data['operation'], geom, attempt):
                     requeued += 1
                     tiles_requeued_total.inc()
                 else:
-                    gave_up.append(tile_id)
+                    add_abandoned_tile(job_id, tile_id)
 
             producer.flush(timeout=10)
             set_last_reap_time(job_id, now)
-
-            if gave_up:
-                set_job_status(job_id, 'degraded')
-                pipeline = 'ml' if job_data['operation'] == 'object_detection' else 'opencv'
-                jobs_finished_total.labels(pipeline=pipeline, status='degraded').inc()
-                logger.error(f"Job {job_id[:8]} marked DEGRADED - tiles {gave_up} exceeded "
-                             f"{MAX_TILE_ATTEMPTS} attempts or are unrecoverable")
 
         except Exception as e:
             logger.error(f"Reaper error on job {job_id[:8]}: {str(e)}", exc_info=True)

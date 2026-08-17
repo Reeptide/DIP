@@ -30,7 +30,7 @@ import time
 
 import redis
 
-from app.config import REDIS_HOST, REDIS_PORT
+from app.config import REDIS_HOST, REDIS_PORT, TILE_SIZE
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +52,37 @@ class RedisClient:
         )
         self.max_retries = max_retries
 
-    def _retry_operation(self, operation, *args, **kwargs):
-        """Retry Redis operation with exponential backoff."""
+    def _retry_operation(self, operation, *args, idempotent=True, **kwargs):
+        """Retry Redis operation with exponential backoff.
+
+        idempotent=False (incr/hincrby/rpush/sadd - anything where re-running
+        the same call changes the result, unlike a plain set/get) narrows
+        what counts as safe to retry: a ConnectionError means the command
+        never reached the server (retrying is exactly as safe as the first
+        attempt), but a TimeoutError only means the client gave up waiting
+        for the reply - the command may have already been applied server-
+        side. Retrying an hincrby after a timeout can silently double-count.
+        Found during a full-project review: incr_tile_attempts() retrying
+        blindly on any redis.RedisError (TimeoutError included) could burn
+        a tile's retry budget and get it abandoned after fewer than
+        MAX_TILE_ATTEMPTS real failures - the same class of bug leader
+        election was added to prevent, arriving through Redis instead of
+        two masters. Non-idempotent operations now raise immediately on
+        TimeoutError instead of retrying blind.
+        """
         for attempt in range(self.max_retries):
             try:
                 return operation(*args, **kwargs)
+            except redis.TimeoutError as e:
+                if not idempotent:
+                    logger.error(f"Redis operation timed out (not retrying - not idempotent): {e}")
+                    raise
+                if attempt == self.max_retries - 1:
+                    logger.error(f"Redis operation failed after {self.max_retries} attempts: {e}")
+                    raise
+                wait_time = 0.1 * (2 ** attempt)
+                logger.warning(f"Redis timeout, retrying in {wait_time}s: {e}")
+                time.sleep(wait_time)
             except redis.RedisError as e:
                 if attempt == self.max_retries - 1:
                     logger.error(f"Redis operation failed after {self.max_retries} attempts: {e}")
@@ -72,13 +98,10 @@ class RedisClient:
         return self._retry_operation(self.client.get, key)
 
     def incr(self, key):
-        return self._retry_operation(self.client.incr, key)
+        return self._retry_operation(self.client.incr, key, idempotent=False)
 
     def delete(self, *keys):
         return self._retry_operation(self.client.delete, *keys)
-
-    def setex(self, key, time, value):
-        return self._retry_operation(self.client.setex, key, time, value)
 
     def hset(self, key, mapping):
         return self._retry_operation(self.client.hset, key, mapping=mapping)
@@ -90,13 +113,19 @@ class RedisClient:
         return self._retry_operation(self.client.hgetall, key)
 
     def hincrby(self, key, field, amount=1):
-        return self._retry_operation(self.client.hincrby, key, field, amount)
+        return self._retry_operation(self.client.hincrby, key, field, amount, idempotent=False)
 
     def hlen(self, key):
         return self._retry_operation(self.client.hlen, key)
 
     def rpush(self, key, value):
-        return self._retry_operation(self.client.rpush, key, value)
+        return self._retry_operation(self.client.rpush, key, value, idempotent=False)
+
+    def sadd(self, key, value):
+        return self._retry_operation(self.client.sadd, key, value, idempotent=False)
+
+    def smembers(self, key):
+        return self._retry_operation(self.client.smembers, key)
 
     def lrange(self, key, start, end):
         return self._retry_operation(self.client.lrange, key, start, end)
@@ -119,8 +148,18 @@ redis_client = RedisClient(REDIS_HOST, REDIS_PORT)
 # ============================================================================
 
 def create_job(job_id, *, original_filename, operation, original_width,
-                original_height, expected_tiles, active_workers):
-    """Create a job's metadata hash. Called once, at upload time."""
+                original_height, expected_tiles, active_workers, tile_size=TILE_SIZE):
+    """Create a job's metadata hash. Called once, at upload time.
+
+    tile_size is stored per-job, not read from the global TILE_SIZE default
+    at reap time - TILE_SIZE is now a runtime-overridable config value (see
+    app/config.py's tile-size sweep story), so a job created under one
+    value and reaped after a config change (or, in this repo, literally
+    reaped by bench/run_tile_size_sweep.py restarting master with a
+    different TILE_SIZE) would have its tile geometry recomputed wrong -
+    tile_geometries() would silently produce a different tile_id layout
+    than what was actually dispatched.
+    """
     now = time.time()
     key = f"job:{job_id}"
     redis_client.hset(key, {
@@ -129,6 +168,7 @@ def create_job(job_id, *, original_filename, operation, original_width,
         'operation': operation,
         'original_width': original_width,
         'original_height': original_height,
+        'tile_size': tile_size,
         'timestamp': now,
         'processing_start': now,
         'status': 'processing',
@@ -151,6 +191,9 @@ def get_job(job_id):
         'operation': raw.get('operation', 'unknown'),
         'original_width': int(raw.get('original_width', 0)),
         'original_height': int(raw.get('original_height', 0)),
+        # Fallback to the current default only for jobs created before this
+        # field existed - a live job always has it set at create_job() time.
+        'tile_size': int(raw.get('tile_size', TILE_SIZE)),
         'timestamp': float(raw.get('timestamp', 0)),
         'processing_start': float(raw.get('processing_start', 0)),
         'status': raw.get('status', 'unknown'),
@@ -164,11 +207,19 @@ def get_job(job_id):
 
 
 def mark_job_completed(job_id, result_path):
-    redis_client.hset(f"job:{job_id}", {
+    key = f"job:{job_id}"
+    redis_client.hset(key, {
         'status': 'completed',
         'result_path': result_path,
         'completion_time': time.time(),
     })
+    # A normal HSET on an already-live hash preserves its existing TTL, but
+    # if job:{id} had already expired (job older than JOB_TTL_SECONDS) and
+    # a straggler write like this one arrives anyway, HSET recreates it
+    # fresh with NO TTL - an immortal key. Re-applying the TTL on every
+    # write closes that gap; found during a full-project review, alongside
+    # the same fix in set_job_status()/set_last_reap_time() below.
+    redis_client.expire(key, JOB_TTL_SECONDS)
 
 
 # ============================================================================
@@ -203,7 +254,9 @@ def record_tile_result(job_id, tile_id, tile_info: dict, processing_time: float)
     if is_new_tile:
         redis_client.rpush(latencies_key, processing_time)
         redis_client.expire(latencies_key, JOB_TTL_SECONDS)
-        redis_client.hincrby(f"job:{job_id}", 'results_count', 1)
+        job_key = f"job:{job_id}"
+        redis_client.hincrby(job_key, 'results_count', 1)
+        redis_client.expire(job_key, JOB_TTL_SECONDS)  # see mark_job_completed()
     else:
         logger.info(f"Duplicate result for job {job_id[:8]} tile {tile_id} ignored (at-least-once delivery)")
 
@@ -211,7 +264,9 @@ def record_tile_result(job_id, tile_id, tile_info: dict, processing_time: float)
 
 
 def set_job_status(job_id, status):
-    redis_client.hset(f"job:{job_id}", {'status': status})
+    key = f"job:{job_id}"
+    redis_client.hset(key, {'status': status})
+    redis_client.expire(key, JOB_TTL_SECONDS)  # see mark_job_completed()
 
 
 def get_tile_results(job_id) -> dict:
@@ -255,20 +310,40 @@ def incr_tile_attempts(job_id, tile_id) -> int:
     return count
 
 
+def add_abandoned_tile(job_id, tile_id) -> None:
+    """Record a tile the reaper has permanently given up on (exceeded
+    MAX_TILE_ATTEMPTS, or its source blob is gone). Persisted so a poison
+    tile is never retried again, and - the reason this exists as its own
+    set rather than just being implied by the job flipping to 'degraded' -
+    so ONE unrecoverable tile doesn't have to mean giving up on every OTHER
+    tile still legitimately in flight in the same job. See reap_once()'s
+    completion check."""
+    key = f"job:{job_id}:abandoned"
+    redis_client.sadd(key, str(tile_id))
+    redis_client.expire(key, JOB_TTL_SECONDS)
+
+
+def get_abandoned_tiles(job_id) -> set:
+    members = redis_client.smembers(f"job:{job_id}:abandoned") or set()
+    return {int(t) for t in members}
+
+
 def get_last_reap_time(job_id) -> float:
     raw = redis_client.hget(f"job:{job_id}", 'last_reap_time')
     return float(raw) if raw else 0.0
 
 
 def set_last_reap_time(job_id, when: float):
-    redis_client.hset(f"job:{job_id}", {'last_reap_time': when})
+    key = f"job:{job_id}"
+    redis_client.hset(key, {'last_reap_time': when})
+    redis_client.expire(key, JOB_TTL_SECONDS)  # see mark_job_completed()
 
 
 def delete_job_tile_state(job_id):
     """Delete the tiles/latencies keys after reconstruction - the job's own
     metadata hash (job:{job_id}) is kept so completed jobs still show up in
     /metadata's job listing."""
-    redis_client.delete(f"job:{job_id}:tiles", f"job:{job_id}:latencies")
+    redis_client.delete(f"job:{job_id}:tiles", f"job:{job_id}:latencies", f"job:{job_id}:abandoned")
 
     # The reaper's per-tile attempt counters are only meaningful while the
     # job is in flight; they carry a TTL as a backstop but a completed job

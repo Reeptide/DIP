@@ -9,15 +9,30 @@ a hash key).
 import logging
 import time
 from datetime import datetime
+from functools import wraps
 
 from flask import Blueprint, jsonify, request
 
-from app.jobstore import redis_client, get_job
+from app.config import ADMIN_TOKEN
+from app.jobstore import redis_client, get_job, JOB_TTL_SECONDS
 from master.heartbeat import heartbeat_tracker
 
 logger = logging.getLogger(__name__)
 
 admin_bp = Blueprint('admin', __name__)
+
+
+def require_admin_token(f):
+    """Gate a destructive admin route behind a shared secret. See
+    app/config.py's ADMIN_TOKEN for why this exists and what it isn't."""
+    @wraps(f)
+    def wrapped(*args, **kwargs):
+        if not ADMIN_TOKEN:
+            return jsonify({'error': 'Admin routes are disabled (ADMIN_TOKEN not configured)'}), 503
+        if request.headers.get('X-Admin-Token') != ADMIN_TOKEN:
+            return jsonify({'error': 'Missing or invalid X-Admin-Token header'}), 401
+        return f(*args, **kwargs)
+    return wrapped
 
 
 def _job_ids_from_keys(all_keys):
@@ -28,54 +43,72 @@ def _job_ids_from_keys(all_keys):
     ]
 
 
-@admin_bp.route('/jobs', methods=['GET'])
-def list_jobs():
-    """List recent jobs (for debugging)."""
-    try:
-        return jsonify({
-            'message': 'Job listing not implemented. Use /status/<job_id> to check specific jobs.',
-            'active_workers': len(heartbeat_tracker.get_active_workers())
-        }), 200
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+def _scan_and_classify_keys():
+    """One full Redis key scan, classified into job/tile-tracking/system/
+    counter/orphaned buckets. Shared by /metadata and /metadata/cleanup so
+    the two can't drift on what counts as an orphan - they used to (this
+    function didn't exist; /metadata/cleanup didn't either) until a review
+    found the orphan-detecting UI button called an endpoint that was never
+    implemented."""
+    all_keys = []
+    cursor = '0'
+    while cursor != 0:
+        cursor, keys = redis_client.client.scan(cursor=cursor, count=1000)
+        all_keys.extend(keys)
+
+    job_ids = set(_job_ids_from_keys(all_keys))
+    job_keys = [f"job:{jid}" for jid in job_ids]
+    # ':attempts' keys are the reaper's per-tile requeue counters (Step 7);
+    # ':abandoned' is the reaper's per-job unrecoverable-tile set (see
+    # app/jobstore.py's add_abandoned_tile) - both are job-scoped state,
+    # not orphans.
+    tile_tracking_keys = [
+        k for k in all_keys
+        if k.endswith(':tiles') or k.endswith(':latencies')
+        or k.endswith(':attempts') or k.endswith(':abandoned')
+    ]
+    # heartbeat:{worker_id} (master/heartbeat.py) and dip:master:leader
+    # (app/leader.py) are both real, expected, short-TTL system state, not
+    # orphans - without this they'd get swept up and reported (or on a
+    # real cleanup run, deleted) as garbage.
+    system_keys = [
+        k for k in all_keys
+        if k.startswith('heartbeat:') or k == 'dip:master:leader'
+    ]
+    counter_keys = [k for k in all_keys if k in ('active_workers_count', 'active_workers')]
+
+    classified = set(job_keys) | set(tile_tracking_keys) | set(system_keys) | set(counter_keys)
+    orphaned_keys = [k for k in all_keys if k not in classified]
+
+    return {
+        'all_keys': all_keys,
+        'job_ids': job_ids,
+        'job_keys': job_keys,
+        'tile_tracking_keys': tile_tracking_keys,
+        'system_keys': system_keys,
+        'counter_keys': counter_keys,
+        'orphaned_keys': orphaned_keys,
+    }
 
 
 @admin_bp.route('/metadata', methods=['GET'])
 def get_metadata():
     """Comprehensive metadata about jobs and Redis storage."""
     try:
-        all_keys = []
-        counter_keys = []
-        orphaned_keys = []
-        job_ids = set()
-        job_keys = []
-        tile_tracking_keys = []
-
         try:
-            cursor = '0'
-            while cursor != 0:
-                cursor, keys = redis_client.client.scan(cursor=cursor, count=1000)
-                all_keys.extend(keys)
-
-            job_ids = set(_job_ids_from_keys(all_keys))
-            job_keys = [f"job:{jid}" for jid in job_ids]
-            # ':attempts' keys are the reaper's per-tile requeue counters
-            # (Step 7) - job-scoped state, not orphans.
-            tile_tracking_keys = [
-                k for k in all_keys
-                if k.endswith(':tiles') or k.endswith(':latencies') or k.endswith(':attempts')
-            ]
-
-            for key in all_keys:
-                if key in job_keys or key in tile_tracking_keys:
-                    continue
-                elif key in ['active_workers_count', 'active_workers']:
-                    counter_keys.append(key)
-                else:
-                    orphaned_keys.append(key)
-
+            scan = _scan_and_classify_keys()
         except Exception as e:
             logger.error(f"Error scanning Redis keys: {e}")
+            scan = {'all_keys': [], 'job_ids': set(), 'job_keys': [],
+                    'tile_tracking_keys': [], 'system_keys': [],
+                    'counter_keys': [], 'orphaned_keys': []}
+
+        all_keys = scan['all_keys']
+        job_ids = scan['job_ids']
+        job_keys = scan['job_keys']
+        tile_tracking_keys = scan['tile_tracking_keys']
+        counter_keys = scan['counter_keys']
+        orphaned_keys = scan['orphaned_keys']
 
         jobs = []
         for jid in job_ids:
@@ -156,9 +189,60 @@ def get_metadata():
         return jsonify({'error': str(e)}), 500
 
 
+@admin_bp.route('/metadata/cleanup', methods=['POST'])
+@require_admin_token
+def cleanup_orphaned_keys():
+    """Delete only orphaned Redis keys (job-scoped keys whose job:{id} no
+    longer exists, plus anything else _scan_and_classify_keys() can't
+    explain). `dry_run: true` (the default, and what templates/index.html's
+    "Cleanup Orphaned Keys" button always calls first) reports what would
+    be deleted without deleting anything.
+
+    This route didn't exist until now - the UI button already called it
+    and expected this exact {dry_run, orphaned_keys_found, valid_jobs,
+    total_keys} response shape, silently 404ing every time, found during a
+    full-project review. Implemented to match what the frontend already
+    expected rather than changing the frontend to match a different,
+    already-existing route (nuclear-cleanup and clear both do something
+    materially different - a full flush-and-restore and an age-based
+    purge, respectively - neither is "just delete the orphans").
+    """
+    data = request.get_json() or {}
+    dry_run = data.get('dry_run', True)
+
+    try:
+        scan = _scan_and_classify_keys()
+        orphaned = scan['orphaned_keys']
+
+        if not dry_run and orphaned:
+            redis_client.delete(*orphaned)
+            logger.warning(f"Deleted {len(orphaned)} orphaned key(s)")
+
+        return jsonify({
+            'dry_run': dry_run,
+            'orphaned_keys_found': len(orphaned),
+            'valid_jobs': len(scan['job_ids']),
+            'total_keys': len(scan['all_keys']),
+            'deleted': 0 if dry_run else len(orphaned),
+        }), 200
+    except Exception as e:
+        logger.error(f"Cleanup orphaned keys failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @admin_bp.route('/metadata/nuclear-cleanup', methods=['POST'])
+@require_admin_token
 def nuclear_cleanup():
-    """Delete ALL non-essential Redis keys, keeping only job records."""
+    """Delete ALL non-essential Redis keys, keeping only job records.
+
+    Gated behind require_admin_token: this is a FLUSHDB. Found completely
+    unauthenticated during a full-project review, reachable through the
+    proxy with nothing but a JSON body - and it deletes app/leader.py's
+    `dip:master:leader` key along with everything else, which is a
+    deterministic way to trigger split-brain (a follower can immediately
+    SET NX and win while the old leader's local state hasn't caught up),
+    not just data loss.
+    """
     try:
         data = request.get_json() or {}
         if not data.get('confirm_nuclear', False):
@@ -186,10 +270,12 @@ def nuclear_cleanup():
         restored = 0
         for key, mapping in job_backup.items():
             redis_client.hset(key, mapping)
+            # hset alone leaves the restored hash with no TTL - it would
+            # otherwise live forever, unlike every other job hash in the
+            # system (see app/jobstore.py's JOB_TTL_SECONDS). Missed in the
+            # original version of this route; found during review.
+            redis_client.expire(key, JOB_TTL_SECONDS)
             restored += 1
-
-        redis_client.set('active_workers_count', '0')
-        redis_client.set('active_workers', '[]')
 
         logger.warning(f"NUCLEAR CLEANUP COMPLETE: Restored {restored} jobs")
 
@@ -205,6 +291,7 @@ def nuclear_cleanup():
 
 
 @admin_bp.route('/metadata/clear', methods=['POST'])
+@require_admin_token
 def clear_old_jobs():
     """Clear completed jobs older than N hours (default 24)."""
     try:
@@ -242,26 +329,9 @@ def clear_old_jobs():
         logger.error(f"Error clearing jobs: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-
-@admin_bp.route('/debug/redis-test', methods=['GET'])
-def debug_redis_test():
-    """Test Redis connectivity and basic operations."""
-    from app.config import REDIS_HOST, REDIS_PORT
-    try:
-        ping_result = redis_client.ping()
-        test_key = f"test_key_{int(time.time())}"
-        redis_client.set(test_key, "test_value", ex=60)
-        read_result = redis_client.get(test_key)
-        db_size = redis_client.client.dbsize()
-        all_keys = redis_client.client.keys('*')
-
-        return jsonify({
-            'redis_ping': ping_result,
-            'test_write': test_key,
-            'test_read': read_result,
-            'database_size': db_size,
-            'all_keys': all_keys[:20],
-            'redis_config': {'host': REDIS_HOST, 'port': REDIS_PORT}
-        }), 200
-    except Exception as e:
-        return jsonify({'error': str(e), 'redis_config': {'host': REDIS_HOST, 'port': REDIS_PORT}}), 500
+# /debug/redis-test used to live here: unauthenticated, did a blocking
+# `KEYS '*'` (the exact command app/jobstore.py's own scan_job_ids()
+# docstring says to never use against a live server), and returned raw key
+# names to anyone who asked. Pure leftover debug scaffolding with no
+# purpose /health doesn't already serve - removed rather than gated,
+# during the same review that found the auth gap above.

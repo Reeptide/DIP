@@ -9,7 +9,6 @@ from app.imaging import (
     tile_geometries, split_image_into_tiles, reconstruct_image_from_tiles,
     encode_image, decode_image,
 )
-from app.config import MAX_TILES
 
 
 def make_test_image(width, height, seed=0):

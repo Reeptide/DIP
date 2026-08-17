@@ -5,8 +5,13 @@ Master and worker intentionally use different consumer settings and are
 kept as separate functions rather than unified: the worker manually commits
 offsets only after a tile is fully processed and its result published
 (at-least-once delivery - required for the failure-recovery story in
-Step 7), while master's background consumers (heartbeats, results) are
-best-effort monitoring streams.
+Step 7). master_consumer_conf()'s enable.auto.commit=True default fits
+master's genuinely best-effort monitoring streams (heartbeats, DLQ depth
+polling) - but master/results_consumer.py and master/ml_results_consumer.py
+override it back to manual commit, for the same at-least-once reason the
+worker needs it: they're not just monitoring, they're the only place a
+Kafka result becomes durable Redis state, and a leadership handoff
+shouldn't be able to silently drop one mid-flight.
 """
 import threading
 import logging
@@ -23,7 +28,14 @@ def master_producer_conf() -> dict:
         'bootstrap.servers': KAFKA_BROKER,
         'compression.type': 'gzip',
         'acks': 'all',
-        'retries': 3,
+        # With enable.idempotence=True, librdkafka needs a large retry
+        # budget to actually behave idempotently under transient failures -
+        # a low retries count (this used to be 3) just makes the producer
+        # give up and surface a send failure to the app well before the
+        # idempotence machinery gets a chance to matter. delivery.timeout.ms
+        # (default 120s) is the real bound on how long a send can be
+        # retried, not this count, so it's safe to set this high.
+        'retries': 2147483647,
         # No message.max.bytes override (Kafka's 1MB default is plenty):
         # messages carry a MinIO blob_key, not tile bytes, since Step 5.
         # This used to be set to 50MB to fit ~700KB base64 tile payloads.
@@ -49,7 +61,14 @@ def worker_producer_conf() -> dict:
         'bootstrap.servers': KAFKA_BROKER,
         'compression.type': 'gzip',
         'acks': 'all',
-        'retries': 3,
+        # With enable.idempotence=True, librdkafka needs a large retry
+        # budget to actually behave idempotently under transient failures -
+        # a low retries count (this used to be 3) just makes the producer
+        # give up and surface a send failure to the app well before the
+        # idempotence machinery gets a chance to matter. delivery.timeout.ms
+        # (default 120s) is the real bound on how long a send can be
+        # retried, not this count, so it's safe to set this high.
+        'retries': 2147483647,
         # No message.max.bytes override - see master_producer_conf().
         'request.timeout.ms': 30000,
         'linger.ms': 100,

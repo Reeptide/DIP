@@ -32,7 +32,7 @@ MASTER_URL = "http://localhost:5000"
 
 DURATION_S = 360
 CONCURRENCY = 2
-IMAGE_SIZE = 2048          # 16 tiles at TILE_SIZE=512
+IMAGE_SIZE = 2048          # 64 tiles at the current TILE_SIZE=256 default
 STALL_THRESHOLD_S = 45     # a job this slow is a stall, not just a slow job
 SAMPLE_EVERY_S = 15
 

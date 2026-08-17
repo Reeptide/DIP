@@ -15,9 +15,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.blobstore import put_tile
 from app.config import ML_TASK_TOPIC, PUBLISH_POOL_SIZE
 from app.imaging import encode_image
+from app.jobstore import redis_client
 from app.kafkaio import producer_pool
 
 logger = logging.getLogger(__name__)
+
+
+def _record_publish_failure(job_id):
+    """See master/publisher.py's identical helper - this module had no
+    equivalent at all (no delivery callback, no staging-failure tracking),
+    so a failed ML tile publish was invisible in /detect/status and
+    /metadata's failed_tasks. Found during a full-project review."""
+    try:
+        redis_client.hincrby(f"job:{job_id}", 'failed_tasks', 1)
+    except Exception as e:
+        logger.error(f"Failed to track ML publish error: {e}")
+
+
+def _delivery_callback(err, msg, tile_id, job_id):
+    if err is not None:
+        logger.error(f"ML task delivery FAILED - Job: {job_id}, Tile: {tile_id}, Error: {err}")
+        _record_publish_failure(job_id)
 
 
 def _stage_tile(job_id, tile):
@@ -55,6 +73,8 @@ def publish_ml_tasks(job_id, tiles, batch_size):
                         ML_TASK_TOPIC,
                         key=f"{job_id}:{tile['tile_id']}",
                         value=json.dumps(task).encode('utf-8'),
+                        callback=lambda err, msg, tid=tile['tile_id']:
+                            _delivery_callback(err, msg, tid, job_id)
                     )
                     producer.poll(0)
                     published_count += 1
@@ -65,9 +85,11 @@ def publish_ml_tasks(job_id, tiles, batch_size):
                 except BufferError:
                     producer.flush(timeout=5)
                     failed_count += 1
+                    _record_publish_failure(job_id)
                 except Exception as e:
                     logger.error(f"Error publishing ML tile {tile['tile_id']}: {e}")
                     failed_count += 1
+                    _record_publish_failure(job_id)
 
         producer.flush(timeout=10)
         logger.info(f"ML task publishing complete - Published: {published_count}, Failed: {failed_count}")

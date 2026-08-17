@@ -1,0 +1,38 @@
+# GPU override for the `inference` service - layer on top of the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Needs both pieces below: INFERENCE_USE_GPU is what inference/engine.py
+# gates CUDAExecutionProvider on, the `deploy` reservation is what actually
+# exposes the device to the container. Requires the NVIDIA Container Toolkit
+# on the host.
+#
+# This was previously force-disabled because GPU runs intermittently hung
+# under sustained load (100%+ CPU across many threads, zero forward
+# progress, no exception, clearing on its own). That turned out to be
+# driver-side PTX JIT: this host's RTX 5050 is Blackwell/sm_120 and
+# onnxruntime-gpu 1.19.2 ships no sm_120 code, only compute_80 PTX.
+# requirements-gpu.txt pins onnxruntime-gpu 1.28.0 (CUDA 13 build, native
+# sm_120 cubins) with the CUDA/cuDNN versions its own extras declare - see
+# the comment block there. If GPU runs hang again on different hardware,
+# check the active providers logged at inference startup before assuming
+# it's this same issue.
+#
+# build.args.INSTALL_GPU is what actually pulls requirements-gpu.txt into
+# this image (see Dockerfile) - `docker compose build` needs this file
+# passed alongside `up`/`build` (both `-f` flags) for the inference image
+# to be rebuilt with GPU deps; a plain `docker compose build` against just
+# the base file always builds inference CPU-only.
+services:
+  inference:
+    build:
+      args:
+        INSTALL_GPU: "true"
+    environment:
+      INFERENCE_USE_GPU: "true"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

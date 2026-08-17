@@ -1,0 +1,50 @@
+# GPU extras for the `inference` role only - layered on top of
+# requirements.txt's plain `onnxruntime` when the Dockerfile's INSTALL_GPU
+# build arg is set (see docker-compose.gpu.yml). Split out during a
+# full-project review: these were previously unconditional in
+# requirements.txt, bloating the master/worker images with CUDA they never
+# touch and breaking the build outright on arm64 (these wheels are
+# linux/x86_64-only).
+#
+# It does NOT bundle CUDA itself, though - nvidia-container-toolkit's GPU
+# passthrough only injects driver libraries (libcuda.so etc), not the full
+# CUDA Toolkit runtime. The nvidia-* packages below are what actually
+# supply libcublasLt.so/libcudnn.so inside the container - same mechanism
+# PyTorch's GPU wheels use.
+#
+# WHY 1.28.0 / CUDA 13 AND NOT THE OLDER 1.19.2 / CUDA 12.4 PINS:
+# This box's GPU is an RTX 5050, i.e. Blackwell, compute capability sm_120.
+# onnxruntime's own release build script decides which GPU architectures get
+# compiled into the wheel (tools/ci_build/github/linux/build_linux_python_package.sh,
+# CMAKE_CUDA_ARCHITECTURES). At the v1.19.2 tag that list is
+# "52;60;61;70;75;80" - the newest cubin is sm_80 and the newest PTX is
+# compute_80, so on sm_120 hardware every CUDA kernel has to be JIT-compiled
+# from compute_80 PTX by the driver at runtime. That JIT is multi-threaded,
+# CPU-bound, throws no exception and eventually succeeds - which is exactly
+# the "100%+ CPU across ~60 threads, zero forward progress, no error, clears
+# on its own" hang this project hit under sustained load. It was never a
+# mismatched-cuDNN problem; no combination of CUDA 12 library versions can
+# fix it, because the wheel simply contains no sm_120 code.
+#
+# The same script gained a real fix in the 1.24+ CUDA 13 builds, where the
+# list becomes "75-real;80-real;86-real;89-real;90-real;100-real;120-real;
+# 120-virtual" - native sm_120 cubins, no JIT. onnxruntime-gpu on PyPI is the
+# CUDA 13 build from 1.27 onwards (see the CUDA/cuDNN compatibility table at
+# onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html), so
+# 1.28.0 is the oldest PyPI release that natively supports this GPU.
+#
+# The library versions below are NOT hand-assembled: they are the exact
+# resolution of onnxruntime-gpu's own "cuda" and "cudnn" extras
+# (pip install "onnxruntime-gpu[cuda,cudnn]==1.28.0"), i.e. the combination
+# the wheel itself declares it is built and tested against. They are listed
+# explicitly rather than left as an extras marker so the set is pinned and
+# reproducible. Host driver 580.173.02 exposes CUDA 13.0, so the CUDA 13
+# runtime needs no forward-compat shim.
+onnxruntime-gpu==1.28.0
+nvidia-cublas==13.6.1.10
+nvidia-cuda-nvrtc==13.3.33
+nvidia-cuda-runtime==13.3.29
+nvidia-cudnn-cu13==9.24.0.43
+nvidia-cufft==12.3.0.29
+nvidia-curand==10.4.3.29
+nvidia-nvjitlink==13.3.33

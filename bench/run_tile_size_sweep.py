@@ -92,6 +92,14 @@ def upload_and_wait(image, operation, timeout=JOB_TIMEOUT_S):
 
     wall_clock_s = time.time() - t0
     tile_latencies_ms = [t * 1000 for t in status.get('tile_latencies_s', [])]
+
+    # See bench/run_bench.py's identical call for why: /reconstruct is the
+    # only thing that deletes this job's MinIO blobs on the OpenCV path.
+    try:
+        requests.post(f"{MASTER_URL}/reconstruct/{job_id}", timeout=30).raise_for_status()
+    except requests.RequestException as e:
+        print(f"  warning: reconstruct cleanup failed for job {job_id}: {e}")
+
     return wall_clock_s, tile_latencies_ms, tiles_count
 
 

@@ -97,9 +97,20 @@ MAX_TILE_ATTEMPTS = int(os.getenv('MAX_TILE_ATTEMPTS', 3))
 RATE_LIMIT = 10
 RATE_WINDOW = 60
 
+# --- Admin route auth ----------------------------------------------------
+# Gates master/admin_routes.py's destructive endpoints (nuclear-cleanup,
+# clear). No insecure default - unset means those routes refuse every
+# request (503) rather than silently running unauthenticated. This isn't a
+# real auth system (no user accounts, no rotation) - it's a shared secret,
+# appropriate for what these routes actually are: an operator maintenance
+# tool, not a user-facing feature. Found reachable with zero auth at all
+# during a full-project review; a POST here deletes the leader-election
+# lock along with everything else, which is a real split-brain trigger,
+# not just a DoS.
+ADMIN_TOKEN = os.getenv('ADMIN_TOKEN')
+
 # --- Kafka producer batching (master's task publisher) -------------------
 BATCH_SIZE = 5
-BATCH_FLUSH_INTERVAL = 0.05
 
 # Threads used to encode tiles and PUT them to MinIO while publishing a job.
 # The publish loop used to do this one tile at a time on the request thread,

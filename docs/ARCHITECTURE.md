@@ -42,7 +42,7 @@ flowchart LR
     Prom[Prometheus]
     Graf[Grafana]
 
-    UI -->|/upload, /detect| M
+    UI -->|/upload, /detect - /detect is API-only, no UI button for it| M
     M -->|publish, threaded PUT| T
     M -->|publish| MLT
     M --> MinIO
@@ -158,7 +158,7 @@ parallelize); `cv2.setNumThreads(1)` pins each container to scale via more conta
 not more internal threads.
 
 **Result**: a quiet 1-vs-8-worker spot check (`bench/results/post_fix_check.csv`)
-showed **33.2 → 52.9 tiles/s (1.67x)**; a fuller sweep across 1/2/4/6/8/12 workers
+showed **31.62 → 52.85 tiles/s (1.67x)**; a fuller sweep across 1/2/4/6/8/12 workers
 (`bench/results/final.csv`, `bench/results/final_speedup.png` — the README's headline
 chart) showed the same fix produce **30.5 → 68.1 tiles/s (2.2x) peaking at 6 workers**,
 with a dip at 8 that recovers by 12 - almost certainly host contention from another
@@ -385,11 +385,13 @@ committing to a fix.
 
 **Fix**: `onnxruntime-gpu==1.28.0` - the oldest PyPI release built with native
 `120-real` cubins (PyPI's package became a CUDA 13 build starting at 1.27). The
-CUDA/cuDNN/cuBLAS pins in `requirements.txt` are the exact resolution of
-onnxruntime-gpu's own declared `[cuda,cudnn]` extras this time, not hand-assembled.
-`inference/engine.py` calls `ort.preload_dlls()` (ONNX Runtime's own supported
-mechanism) to resolve those libraries out of their pip package locations, rather
-than a hardcoded `LD_LIBRARY_PATH`.
+CUDA/cuDNN/cuBLAS pins in `requirements-gpu.txt` (split out from the base
+`requirements.txt` during a later review - see that file's own comment) are the
+exact resolution of onnxruntime-gpu's own declared `[cuda,cudnn]` extras this
+time, not hand-assembled. `inference/engine.py` calls `ort.preload_dlls()`
+(ONNX Runtime's own supported mechanism) to resolve those libraries out of
+their pip package locations; `Dockerfile`'s `LD_LIBRARY_PATH` sets the same
+paths as a redundant fallback, not a replacement for it.
 
 **Sustained load test, not a synthetic single call**: 1018 jobs / 16,288 tiles over
 380 continuous seconds, zero stalls, zero exceptions, p95 job time 0.93s, GPU
@@ -397,11 +399,13 @@ memory pinned at ~2.15GB throughout.
 
 **GPU vs CPU** (`bench/results/inference_batch_sweep_gpu.csv` vs the CPU
 equivalent): ~3.7x throughput, ~4.5x lower p50 latency (batch=1: 127.9ms CPU vs.
-28.2ms GPU). One finding worth flagging as a follow-up, not yet fixed: on GPU,
-**batch=1 is now the fastest configuration** - the forward pass itself dropped to
-~7ms, so `INFERENCE_BATCH_TIMEOUT_MS` (50ms, tuned during the CPU era) is now the
-dominant cost at low load rather than compute. The batching tuning that made sense
-for a 120-150ms/tile CPU workload is actively counterproductive for a ~7ms/tile GPU
+28.2ms GPU). One finding worth flagging, later fixed (see "Where this still doesn't
+scale" below - `INFERENCE_BATCH_TIMEOUT_MS` now defaults hardware-aware): on GPU,
+**batch=1 is now the fastest configuration** - the forward pass
+itself dropped to ~7ms, so `INFERENCE_BATCH_TIMEOUT_MS` (50ms, tuned during the CPU
+era) is now the dominant cost at low load rather than compute. The batching tuning
+that made sense for a 120-150ms/tile CPU workload is actively counterproductive for
+a ~7ms/tile GPU
 one.
 
 **GPU horizontal scaling looks different from CPU's, and it's worth being precise
@@ -428,12 +432,17 @@ still beats CPU's own best (8 replicas, 11.2 tiles/s) by roughly 4x.
 ## Observability (Step 8)
 
 Prometheus + Grafana, provisioned in-repo (no manual dashboard setup after
-`docker compose up`). Master exposes `/metrics` as a normal Flask route (single fixed
-container, static scrape target); worker and inference run
-`prometheus_client.start_http_server(9200)` and are scraped via `dns_sd_configs`
-instead of static targets, because `--scale worker=N` gives each replica a distinct
-IP with no static port mapping — Compose's embedded DNS resolves the service name to
-one A record per running replica, which Prometheus's DNS-SD polls directly.
+`docker compose up`). Master exposes `/metrics` as a normal Flask route (it already
+runs an HTTP server, unlike worker/inference); worker and inference run
+`prometheus_client.start_http_server(9200)` instead. All three are scraped via
+`dns_sd_configs`, not static targets - this section originally described master as a
+single fixed container with a static scrape target, which stopped being true once
+master itself became horizontally scalable (see "Master, upgraded to
+active-passive" below) and its own Prometheus job had to switch to DNS-SD too, for
+the same reason worker/inference already needed it: `--scale <service>=N` gives
+each replica a distinct IP with no static port mapping. Compose's embedded DNS
+resolves the service name to one A record per running replica, which Prometheus's
+DNS-SD polls directly.
 
 ## Where this still doesn't scale (the honest part)
 - **Both CPU and GPU have a real ceiling, just different shapes of one.** CPU's
@@ -450,6 +459,19 @@ one A record per running replica, which Prometheus's DNS-SD polls directly.
   longer a guess, just not a per-request decision. A production system might pick
   tile size per-upload based on image dimensions and current worker count rather
   than one global default for every job.
+- **Two of the thirteen OpenCV operations are global operations applied
+  tile-locally, and the reconstructed output is NOT the same as running them on
+  the whole image** - found during a full-project review, not something the
+  original tiling design accounted for. `edge_sobel` normalizes each tile by
+  its OWN max gradient (`app/ops.py`); `histogram_equalization` equalizes each
+  tile's histogram independently. Both mean a reconstructed image has visible
+  per-tile brightness/contrast seams at tile boundaries, and differs from
+  what the same operation would produce on the undivided image - genuinely
+  different output, not a rounding-error-level discrepancy. `tests/test_ops.py`
+  only asserts shape/dtype per op, so nothing currently catches this. A real
+  fix needs either a second aggregation pass (compute the global max/histogram
+  across all tiles before normalizing any of them) or accepting the tradeoff
+  and documenting it in the UI, not just here.
 
 ## Tile size: from "tuned by inspection" to actually measured
 

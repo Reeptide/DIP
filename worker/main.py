@@ -162,6 +162,12 @@ class Worker:
                 if operation not in OPERATION_MAP:
                     logger.error(f"Unknown operation: {operation}")
                     self.metrics['tasks_failed'] += 1
+                    # Missing here before - found during a full-project
+                    # review: this path (unlike the retries-exhausted path
+                    # below) incremented only the worker's own in-memory
+                    # counter, so an unknown-operation tile went to the DLQ
+                    # with zero Prometheus signal that anything failed.
+                    tiles_processed_total.labels(pipeline='opencv', status='failed').inc()
                     return None
 
                 tile_image = decode_image(get_tile(blob_key))
@@ -194,7 +200,14 @@ class Worker:
             except Exception as e:
                 logger.error(f"Error processing tile {tile_id} (attempt {attempt + 1}): {str(e)}")
                 if attempt < max_retries:
-                    time.sleep(0.5 * (attempt + 1))  # exponential backoff
+                    # Actually exponential (0.5s, 1s, 2s, ...) - the old
+                    # `0.5 * (attempt + 1)` is linear (0.5s, 1s, 1.5s), and
+                    # only matched the comment's claim by coincidence at
+                    # the default max_retries=2 (both formulas give 0.5s
+                    # then 1s for attempts 0 and 1; they diverge from
+                    # attempt 2 onward, which max_retries=2 never reaches).
+                    # Found during a full-project review.
+                    time.sleep(0.5 * (2 ** attempt))
                 else:
                     self.metrics['tasks_failed'] += 1
                     tiles_processed_total.labels(pipeline='opencv', status='failed').inc()
@@ -211,13 +224,43 @@ class Worker:
             job_id = result['job_id']
             tile_id = result['tile_id']
 
+            # Plain list, not a bool, so the callback (which fires during
+            # flush() below, on this same thread) can report a delivery
+            # failure back out - a closure can't rebind an outer bool, but
+            # can mutate a shared container.
+            delivery_failed = []
+
+            def _on_delivery(err, msg):
+                self._result_callback(err, msg, tile_id)
+                if err is not None:
+                    delivery_failed.append(err)
+
             self.task_producer.produce(
                 RESULT_TOPIC,
                 key=f"{job_id}:{tile_id}",  # see master/publisher.py for why
                 value=json.dumps(result).encode('utf-8'),
-                callback=lambda err, msg: self._result_callback(err, msg, tile_id)
+                callback=_on_delivery,
             )
-            self.task_producer.poll(0)
+            # flush(), not poll(0): run()'s caller commits the task's Kafka
+            # offset immediately after this returns True, which is what
+            # makes the tile unrecoverable from 'tasks' - poll(0) only
+            # guarantees the message entered librdkafka's local send queue,
+            # not that it left the process. With linger.ms=100 that's a
+            # real window where a killed worker commits an offset for a
+            # result that was never actually sent - found during a
+            # full-project review, the same reasoning send_to_dlq() above
+            # already applies to its own produce(). flush()'s return value
+            # (messages still queued after the timeout) is also checked,
+            # not discarded - a timed-out flush must not be treated as a
+            # successful publish either.
+            still_queued = self.task_producer.flush(timeout=5)
+            if still_queued > 0:
+                logger.warning(f"Flush timed out with {still_queued} message(s) still queued "
+                                f"for tile {tile_id} - not committing, will be redelivered")
+                return False
+            if delivery_failed:
+                logger.error(f"Result delivery failed for tile {tile_id}: {delivery_failed[0]}")
+                return False
             return True
 
         except BufferError:
@@ -242,9 +285,14 @@ class Worker:
         tile_id = task.get('tile_id', -1)
         try:
             # The reaper stamps requeued tasks with 'attempt'; the master's
-            # original dispatch carries none, which is attempt 1.
+            # original dispatch carries none, which is attempt 1. This is
+            # the attempt that just failed - no +1 needed (that was a real
+            # off-by-one: the original dispatch, attempt 1, was being
+            # recorded here as "attempt 2", and a reaper requeue stamped
+            # attempt=2 was recorded as "attempt 3" - found during a
+            # full-project review).
             dlq_record = dict(task)
-            dlq_record['attempt'] = int(task.get('attempt', 1)) + 1
+            dlq_record['attempt'] = int(task.get('attempt', 1))
             dlq_record['failed_by'] = self.worker_id
             dlq_record['failure_reason'] = reason
             dlq_record['failed_at'] = time.time()
@@ -319,8 +367,19 @@ class Worker:
                 if msg.error():
                     if msg.error().code() == KafkaError._PARTITION_EOF:
                         continue
+                    # continue, not break: a transient broker error here
+                    # used to exit this whole loop (and the process, since
+                    # run() returns right after) - restart: unless-stopped
+                    # does bring it back, but a broker blip cycles the
+                    # entire worker pool and triggers a group rebalance
+                    # storm instead of just being retried on the next
+                    # poll(), like inference/main.py's poll_loop() and
+                    # master/heartbeat.py's monitor_heartbeats() already do
+                    # for the identical condition. Found during a
+                    # full-project review as an inconsistency between the
+                    # three consumer loops in this codebase.
                     logger.error(f"Kafka error: {msg.error()}")
-                    break
+                    continue
 
                 try:
                     task = json.loads(msg.value().decode('utf-8'))
@@ -334,7 +393,25 @@ class Worker:
                             self.consumer.commit(message=msg)
                             logger.info(f"Result published and offset committed for tile {task['tile_id']}")
                         else:
-                            logger.error(f"Failed to publish result for tile {task['tile_id']}")
+                            # Not committing here does NOT get this tile
+                            # redelivered while this process keeps running -
+                            # the consumer's local position already
+                            # advanced past msg the moment poll() returned
+                            # it; skipping the commit only matters for a
+                            # future rebalance/restart, which might be a
+                            # long time away or never happen. The tile was
+                            # otherwise just gone with nothing but a log
+                            # line - no DLQ record, no metric. Found during
+                            # a full-project review. Route it to the DLQ
+                            # the same way the "retries exhausted" branch
+                            # below already does, then commit - the tile
+                            # itself processed fine, it's specifically
+                            # publishing that failed, so treating this like
+                            # any other terminal failure is consistent
+                            # rather than a silent third outcome.
+                            logger.error(f"Failed to publish result for tile {task['tile_id']}, sending to DLQ")
+                            self.send_to_dlq(task, 'failed to publish result to Kafka')
+                            self.consumer.commit(message=msg)
                     else:
                         # Retries exhausted. Park it on the DLQ first, then
                         # commit so 'tasks' doesn't redeliver it - the retry
@@ -382,8 +459,13 @@ def validate_config():
         errors.append("KAFKA_BROKER not configured")
 
     try:
+        # Producer() doesn't connect eagerly and flush() on an empty queue
+        # returns immediately regardless of broker reachability - this
+        # always passed, even against an unreachable broker. list_topics()
+        # actually round-trips to the broker. Found during a full-project
+        # review (master/app.py had the identical no-op check).
         test_producer = Producer({'bootstrap.servers': KAFKA_BROKER})
-        test_producer.flush(timeout=5)
+        test_producer.list_topics(timeout=5)
         logger.info("Kafka connectivity test passed")
     except Exception as e:
         errors.append(f"Cannot connect to Kafka: {str(e)}")

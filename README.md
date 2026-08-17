@@ -23,6 +23,12 @@ python scripts/download_model.py   # pulls the ONNX models (gitignored, ~27MB)
 docker compose up -d --scale worker=4
 ```
 
+Runs CPU-only by default, on any machine. On a host with an NVIDIA GPU (+ Container
+Toolkit), layer in `docker-compose.gpu.yml` for the inference service instead:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --scale worker=4
+```
+
 Then:
 - Upload UI: http://localhost:5000
 - Grafana (dashboard auto-provisioned, no login needed): http://localhost:3000
@@ -65,17 +71,16 @@ pattern (Step 5) and atomic Redis hashes (Step 6) removed two ceilings that made
 
 ![Speedup curve](bench/results/final_speedup.png)
 
-**30.5 → 68.1 tiles/s (2.2x) at 6 workers**, large image (144 tiles) — and critically,
-the *shape* of the curve is right: rising throughput with rising latency from genuine
-queueing, not the flat-throughput/rising-latency signature of contention that showed
-up (and got fixed) twice earlier in this project, once for the OpenCV pipeline and
-once for the ML inference pipeline's replica scaling (`docs/ARCHITECTURE.md` covers
-both). Honest caveat on this particular run: throughput dips at 8 workers before
-recovering at 12 — this sweep happened to run while another heavy Docker workload was
-also active on the same host, so treat 6-12 workers as "still clearly scaled up from
-1," not as a precise ranking of 6 vs. 8 vs. 12. A cleaner, quieter 1-vs-8 spot check
-(`bench/results/post_fix_check.csv`) showed the same fix produce a smooth
-31.6 → 52.9 tiles/s.
+**69.4 → 167.1 tiles/s (2.4x) at 8 workers**, large image (576 tiles at the current
+`TILE_SIZE=256` default) — and critically, the *shape* of the curve is right: rising
+throughput with rising latency from genuine queueing, not the flat-throughput/rising-
+latency signature of contention that showed up (and got fixed) twice earlier in this
+project, once for the OpenCV pipeline and once for the ML inference pipeline's
+replica scaling (`docs/ARCHITECTURE.md` covers both). Throughput rises smoothly from
+1 through 8 workers (69.4 → 99.9 → 146.1 → 163.5 → 167.1), then dips at 12
+(138.5) — plausibly host core contention past the point of genuine parallelism
+rather than a regression, but treat 8-12 workers as "still clearly scaled up from
+1," not as a precise ranking of 8 vs. 12.
 
 Regenerate this chart, or re-run any of the other benchmark sweeps
 (`bench/run_inference_batch_sweep.py`, `bench/run_inference_replica_sweep.py`):

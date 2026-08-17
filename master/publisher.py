@@ -1,8 +1,10 @@
 """Publishes tile-processing tasks to Kafka.
 
 Partitioning: no explicit `partition=` is passed to produce(). Kafka's
-default partitioner hashes the message key (tile_id here) and spreads keys
-across however many partitions the topic actually has. The original code
+default partitioner hashes the message key - `f"{job_id}:{tile_id}"`, not
+bare tile_id (a bare tile_id would collide across different jobs' tiles
+sharing the same id, e.g. every job's tile 0) - and spreads keys across
+however many partitions the topic actually has. The original code
 hardcoded `partition = tile_id % 2`, which silently capped usable
 parallelism at 2 consumers no matter how many partitions the topic had or
 how many workers were started - Kafka assigns whole partitions to
@@ -34,11 +36,29 @@ def delivery_callback(err, msg, tile_id, job_id):
     if err is not None:
         logger.error(f"Task delivery FAILED - Job: {job_id}, Tile: {tile_id}, Error: {err}")
         try:
-            redis_client.incr(f"failed_tasks:{job_id}")
+            # HINCRBY on the job:{job_id} hash's own 'failed_tasks' field -
+            # NOT a separate `failed_tasks:{job_id}` string key. That used
+            # to be a different key than the one app/jobstore.py's
+            # get_job() reads ('failed_tasks' as a hash field), so nothing
+            # ever wrote the field get_job() actually returns: /status and
+            # /metadata's failed_tasks were hardcoded zeros in practice,
+            # and the orphan string keys leaked with no TTL. Found during a
+            # full-project review.
+            redis_client.hincrby(f"job:{job_id}", 'failed_tasks', 1)
         except Exception as e:
             logger.error(f"Failed to track delivery error: {e}")
     else:
         logger.debug(f"Task delivered - Tile: {tile_id} -> Partition: {msg.partition()}")
+
+
+def _record_publish_failure(job_id):
+    """Mirror of delivery_callback()'s HINCRBY, for tiles that failed before
+    ever reaching Kafka (blob staging or producer.produce() itself) rather
+    than an async delivery error - see publish_tile_tasks()'s call sites."""
+    try:
+        redis_client.hincrby(f"job:{job_id}", 'failed_tasks', 1)
+    except Exception as e:
+        logger.error(f"Failed to track publish error: {e}")
 
 
 def _stage_tile(job_id, tile):
@@ -110,13 +130,26 @@ def publish_tile_tasks(job_id, tiles, operation, batch_size):
                     logger.warning(f"Producer queue full at tile {tile['tile_id']}, flushing...")
                     producer.flush(timeout=5)
                     failed_count += 1
+                    _record_publish_failure(job_id)
                 except Exception as e:
                     logger.error(f"Error publishing tile {tile['tile_id']}: {e}")
                     failed_count += 1
+                    _record_publish_failure(job_id)
 
         producer.flush(timeout=10)
 
         logger.info(f"Task publishing complete - Published: {published_count}, Failed: {failed_count}, Batches: {batch_count}")
+        # published_count > 0, not published_count == len(tiles): a tile
+        # already staged and produced can't be un-dispatched, so returning
+        # False on a partial failure here would tell /upload's caller
+        # nothing happened when most tiles actually did - the reaper
+        # recovers the rest either way. What WAS missing (found during a
+        # full-project review): staging/produce failures here only updated
+        # the local failed_count variable, never Redis - unlike an async
+        # Kafka delivery failure (delivery_callback above), which already
+        # HINCRBYs job:{id}'s failed_tasks field. A tile that failed to
+        # even get produced was invisible in /status and /metadata.
+        # _record_publish_failure() closes that gap.
         return published_count > 0
 
     except Exception as e:

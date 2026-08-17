@@ -68,7 +68,7 @@ class InferenceWorker:
         consumer_conf = worker_consumer_conf()
         consumer_conf['group.id'] = 'ml-inference-workers'
         self.consumer = Consumer(consumer_conf)
-        self.consumer.subscribe([ML_TASK_TOPIC])
+        self.consumer.subscribe([ML_TASK_TOPIC], on_assign=self._on_assign)
 
         self.producer = Producer(worker_producer_conf())
 
@@ -113,28 +113,55 @@ class InferenceWorker:
                 # was found: a bare loop body with no per-iteration guard).
                 logger.error(f"Error in poller loop: {e}", exc_info=True)
 
-        self._drain_commits()
+        # Synchronous here, not async: this is the final drain before
+        # close(), the loop that was calling poll() is already exiting, so
+        # there's no session-timeout risk left to avoid by going async - and
+        # going async left it unclear whether an in-flight commit was
+        # guaranteed to land before close() tore down the consumer, versus
+        # being silently dropped. Blocking until each commit is acked
+        # removes that ambiguity.
+        self._drain_commits(asynchronous=False)
         self.consumer.close()
         logger.info("Poller thread stopped")
 
-    def _drain_commits(self):
-        # Async, not sync: a synchronous commit() blocks this thread until
-        # the broker acknowledges, and this loop can have many queued at
-        # once (one per tile in a finished batch). Blocking here means not
-        # calling consumer.poll() for that whole stretch - and if that gap
-        # is long enough, the broker times out this consumer's session and
-        # evicts it from the group. It silently rejoins on the next poll()
-        # (a new member ID, no crash, no traceback - which is exactly what
-        # made this bug hard to see: the process looked alive throughout).
+    def _drain_commits(self, asynchronous=True):
+        # Async, not sync, during normal operation: a synchronous commit()
+        # blocks this thread until the broker acknowledges, and this loop
+        # can have many queued at once (one per tile in a finished batch).
+        # Blocking here means not calling consumer.poll() for that whole
+        # stretch - and if that gap is long enough, the broker times out
+        # this consumer's session and evicts it from the group. It silently
+        # rejoins on the next poll() (a new member ID, no crash, no
+        # traceback - which is exactly what made this bug hard to see: the
+        # process looked alive throughout). The final drain at shutdown
+        # passes asynchronous=False instead - see poll_loop().
         while True:
             try:
                 msg = self.to_commit.get_nowait()
             except queue.Empty:
                 return
             try:
-                self.consumer.commit(message=msg, asynchronous=True)
+                self.consumer.commit(message=msg, asynchronous=asynchronous)
             except Exception as e:
                 logger.error(f"Commit failed: {e}")
+
+    def _on_assign(self, consumer, partitions):
+        # confluent-kafka's contract: registering on_assign means WE are
+        # responsible for calling consumer.assign() - it is not done
+        # automatically once a callback is present. If self.paused, also
+        # pause the newly-assigned partitions before returning. Without
+        # this, consumer.pause() in _apply_backpressure() only ever paused
+        # the partitions assigned AT THAT MOMENT - partitions that arrived
+        # via a LATER rebalance (e.g. another `inference` replica joining
+        # or leaving, which --scale inference=N triggers) came back
+        # resumed by default, so the backpressure guard silently stopped
+        # covering part of this consumer's assignment while self.paused
+        # stayed True and the queue kept growing. Found during a
+        # full-project review.
+        consumer.assign(partitions)
+        if self.paused:
+            consumer.pause(partitions)
+            logger.info(f"Rebalance: re-applied backpressure pause to {len(partitions)} newly assigned partition(s)")
 
     def _apply_backpressure(self):
         qsize = self.pending.qsize()
@@ -157,7 +184,24 @@ class InferenceWorker:
         while not self.shutdown_event.is_set():
             batch = self._collect_batch()
             if batch:
-                self._process_batch(batch)
+                try:
+                    self._process_batch(batch)
+                except Exception as e:
+                    # Without this, one bad batch (a CUDA OOM, a malformed
+                    # task, an ONNX runtime error) kills this whole thread
+                    # with no traceback anywhere obvious - the process
+                    # stays up, poll_loop keeps pulling from Kafka, self.pending
+                    # fills to INFERENCE_MAX_QUEUE, backpressure engages
+                    # permanently, and the container looks alive while
+                    # consuming nothing forever. This is exactly the poller
+                    # thread's own silent-death bug (see poll_loop's
+                    # comment) - it got fixed there but the same guard was
+                    # never added here, found during a full-project review.
+                    # The batch's messages are deliberately left uncommitted
+                    # (self.to_commit.put() never runs) so Kafka redelivers
+                    # them - same at-least-once semantics as every other
+                    # failure path in this system.
+                    logger.error(f"Error processing batch of {len(batch)}: {e}", exc_info=True)
         logger.info("Batcher thread stopped")
 
     def _collect_batch(self):
@@ -226,16 +270,45 @@ class InferenceWorker:
 
         processing_time = time.time() - start
         per_tile_time = processing_time / len(tasks)
+        failed_idx = set(range(len(tasks))) - set(valid_idx)
 
-        for _ in tasks:
+        for i, task in enumerate(tasks):
+            if i in failed_idx:
+                # Fetch/decode failed - publishing a "success" result with
+                # detections: [] here (the previous behavior) meant the
+                # tile silently counted toward expected_tiles and the job
+                # would reach 'completed' with a real gap in its detection
+                # set, with no signal anywhere that anything went wrong.
+                # Instead: publish nothing for this tile at all. The reaper
+                # (master/reaper.py) already treats a tile that never shows
+                # up in job:{id}:tiles as missing and will retry it (a
+                # fresh MinIO fetch attempt, so a transient blob-store blip
+                # gets a real second chance) up to MAX_TILE_ATTEMPTS before
+                # marking it abandoned - the same recovery path the OpenCV
+                # pipeline's worker DLQ exists to feed, reused here instead
+                # of inventing a second, ML-specific one.
+                tiles_processed_total.labels(pipeline='ml', status='failed').inc()
+                # NOT dlq_total.labels(pipeline='ml') - the ML pipeline has
+                # no DLQ topic at all (see the comment block below on why:
+                # the reaper's republish path is used instead). That metric
+                # used to get incremented here anyway, so Grafana's
+                # dip_dlq_total panel silently counted something that was
+                # never actually written to any DLQ, next to dip_dlq_depth
+                # measuring the real tasks.dlq. Found during a full-project
+                # review; tiles_processed_total{status='failed'} above is
+                # the real signal for this failure.
+                logger.error(f"Tile {task.get('tile_id')} of job {task.get('job_id', 'unknown')[:8]} "
+                             f"failed permanently for this delivery (fetch/decode error) - no result "
+                             f"published; left for the reaper to retry or abandon")
+                continue
+
             tiles_processed_total.labels(pipeline='ml', status='success').inc()
             tile_processing_seconds.labels(pipeline='ml').observe(per_tile_time)
 
-        for task, dets in zip(tasks, detect_results):
             result = {
                 'job_id': task['job_id'],
                 'tile_id': task['tile_id'],
-                'detections': dets,
+                'detections': detect_results[i],
                 'worker_id': WORKER_ID,
                 'processing_time': per_tile_time,
                 'x': task['x'], 'y': task['y'],
@@ -256,8 +329,25 @@ class InferenceWorker:
                     value=json.dumps(result).encode('utf-8'),
                 )
         self.producer.poll(0)
-        self.producer.flush(timeout=10)
+        # Return value checked, not discarded: it's the count of results
+        # still queued after the timeout, i.e. NOT confirmed delivered.
+        # Found during a full-project review - every message in the batch
+        # used to get queued for commit unconditionally right after this,
+        # so a timed-out flush could commit task offsets for results that
+        # never actually left the process, the same silent-loss class as
+        # worker/main.py's publish_result() fix.
+        still_queued = self.producer.flush(timeout=10)
+        if still_queued > 0:
+            logger.error(f"Flush timed out with {still_queued} ML result(s) still queued - "
+                         f"not committing this batch of {len(msgs)}, will be redelivered")
+            return
 
+        # Every message in the batch is still committed here, failed tiles
+        # included: the failure is "this blob_key never decoded," which
+        # redelivering the SAME Kafka message can't fix (it points at the
+        # same MinIO object). The reaper's retry goes through
+        # master/publisher.py's republish path instead, which is the
+        # correct place for a fresh attempt to originate from.
         for msg in msgs:
             self.to_commit.put(msg)
 

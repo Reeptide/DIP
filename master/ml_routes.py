@@ -4,28 +4,63 @@ ml_tasks/ml_results instead of tasks/results (see app/config.py).
 """
 import logging
 import os
-import time
 import uuid
 
 import cv2
+import numpy as np
 from flask import Blueprint, current_app, jsonify, request
 from werkzeug.utils import secure_filename
 
 from app.config import (
     ALLOWED_EXTENSIONS, TILE_SIZE, MIN_IMAGE_SIZE, MAX_IMAGE_DIMENSION, BATCH_SIZE,
+    DETECT_CONF_THRESHOLD, DETECT_IOU_THRESHOLD,
 )
-from app.imaging import split_image_into_tiles
+from app.imaging import split_image_into_tiles, probe_image_dimensions
 from app.jobstore import create_job, get_job, get_tile_results, get_tile_latencies_ms
 from app.metrics import jobs_created_total
 from master.heartbeat import heartbeat_tracker
 from master.ml_publisher import publish_ml_tasks
+from master.rate_limit import rate_limit
 
 logger = logging.getLogger(__name__)
 
 ml_bp = Blueprint('ml', __name__)
 
 
+def _cross_tile_nms(detections):
+    """Suppress duplicate boxes across tile boundaries, per class - grouped
+    by class_name because cv2.dnn.NMSBoxes only takes boxes+scores, so
+    running it over all classes mixed together would also suppress a
+    genuinely different object of another class overlapping the same
+    region."""
+    if not detections:
+        return detections
+
+    kept = []
+    by_class = {}
+    for det in detections:
+        by_class.setdefault(det['class_name'], []).append(det)
+
+    for dets in by_class.values():
+        if len(dets) == 1:
+            kept.append(dets[0])
+            continue
+        boxes_xywh = [
+            [d['box'][0], d['box'][1], d['box'][2] - d['box'][0], d['box'][3] - d['box'][1]]
+            for d in dets
+        ]
+        confidences = [d['confidence'] for d in dets]
+        indices = cv2.dnn.NMSBoxes(
+            boxes_xywh, confidences, DETECT_CONF_THRESHOLD, DETECT_IOU_THRESHOLD
+        )
+        for idx in np.array(indices).flatten():
+            kept.append(dets[idx])
+
+    return kept
+
+
 @ml_bp.route('/detect', methods=['POST'])
+@rate_limit
 def detect_image():
     """Upload an image for object detection + classification. Same
     validation and tiling as /upload; the difference is entirely in which
@@ -59,6 +94,14 @@ def detect_image():
         filepath = os.path.join(current_app.config['UPLOAD_FOLDER'], f"{job_id}_{filename}")
         file.save(filepath)
 
+        # See master/app.py's /upload for why this runs before imread().
+        with open(filepath, 'rb') as f:
+            header = f.read(65536)
+        probed = probe_image_dimensions(header)
+        if probed and (probed[0] > MAX_IMAGE_DIMENSION or probed[1] > MAX_IMAGE_DIMENSION):
+            os.remove(filepath)
+            return jsonify({'error': f'Image too large. Maximum dimension: {MAX_IMAGE_DIMENSION}px'}), 400
+
         image = cv2.imread(filepath)
         if image is None:
             os.remove(filepath)
@@ -84,6 +127,10 @@ def detect_image():
 
         expected_tiles = len(tiles)
 
+        # image is already decoded into memory (line 63) and tiled from
+        # there - the on-disk upload is never read again on this path.
+        os.remove(filepath)
+
         create_job(
             job_id,
             original_filename=filename,
@@ -92,6 +139,7 @@ def detect_image():
             original_height=height,
             expected_tiles=expected_tiles,
             active_workers=len(active_workers),
+            tile_size=TILE_SIZE,
         )
 
         success = publish_ml_tasks(job_id, tiles, BATCH_SIZE)
@@ -156,6 +204,16 @@ def detect_status(job_id):
                             round(x2 + tile_info['x'], 1), round(y2 + tile_info['y'], 1),
                         ],
                     })
+
+            # An object straddling a tile boundary produces one partial
+            # detection per tile it overlaps (2-4 for a corner) - each tile
+            # is inferred independently in inference/engine.py, with no
+            # visibility into neighboring tiles. inference/engine.py's own
+            # NMS only dedups boxes *within* one tile's output, so those
+            # partial duplicates survive to here. Run the same NMS pass
+            # again, now that every box is in shared original-image
+            # coordinates, to collapse them into one.
+            all_detections = _cross_tile_nms(all_detections)
 
             counts = {}
             for det in all_detections:

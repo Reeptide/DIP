@@ -17,10 +17,11 @@ was narrower: this host's GPU is Blackwell (sm_120), and onnxruntime-gpu
 newest GPU code in that wheel is compute_80 PTX. Every CUDA kernel
 therefore had to be JIT-compiled by the driver at runtime - CPU-bound,
 multi-threaded, silent, and eventually successful, which is exactly the
-observed signature. requirements.txt now pins onnxruntime-gpu 1.28.0 (the
-CUDA 13 build, which compiles native 120-real cubins) plus the exact
+observed signature. requirements-gpu.txt now pins onnxruntime-gpu 1.28.0
+(the CUDA 13 build, which compiles native 120-real cubins) plus the exact
 CUDA/cuDNN versions its own [cuda,cudnn] extras declare, so no JIT is
-involved. See the comment block in requirements.txt for the full reasoning.
+involved. See the comment block in requirements-gpu.txt for the full
+reasoning.
 """
 import logging
 import os
@@ -34,9 +35,14 @@ import onnxruntime as ort
 # path. nvidia-container-toolkit injects only the driver (libcuda.so), not
 # these, so without help onnxruntime cannot dlopen libcublasLt/libcudnn.
 # preload_dlls() is onnxruntime's own supported way to resolve them out of
-# the nvidia site-packages - preferred over hand-maintaining an
-# LD_LIBRARY_PATH list, which silently rots whenever a CUDA major version
-# renames or relocates its package directories, as CUDA 12 -> 13 did.
+# the nvidia site-packages, and is the mechanism actually load-bearing here.
+# Dockerfile ALSO sets a hand-maintained LD_LIBRARY_PATH pointing at the
+# same directories - kept as a redundant fallback (harmless, not a
+# duplicate source of truth to maintain in lockstep) rather than removed,
+# in case a future onnxruntime version drops preload_dlls() or a dependency
+# resolves libraries a different way than expected. Doc drift found during
+# a full-project review: this comment used to claim preload_dlls()
+# REPLACED the LD_LIBRARY_PATH list, but both were live the whole time.
 if hasattr(ort, 'preload_dlls'):
     try:
         ort.preload_dlls()

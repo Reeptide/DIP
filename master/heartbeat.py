@@ -23,6 +23,7 @@ there's no in-memory state left to mirror, the tracker IS Redis now.
 """
 import json
 import logging
+import time
 
 from confluent_kafka import Consumer, KafkaError
 
@@ -42,24 +43,51 @@ class WorkerHeartbeatTracker:
     change."""
 
     def update(self, worker_id, timestamp):
+        # TTL is computed from the heartbeat's OWN timestamp, not from
+        # "now" - found during a full-project review: computing it from
+        # "now" meant a consumer that replays old messages (e.g. a fresh
+        # master with no committed offset yet, or auto.offset.reset=earliest
+        # against a topic with retention) would resurrect a long-dead
+        # worker as "alive" for a full HEARTBEAT_TIMEOUT, regardless of how
+        # old the heartbeat actually was. A heartbeat older than the
+        # timeout is simply dropped instead of written.
+        remaining_s = HEARTBEAT_TIMEOUT - (time.time() - timestamp)
+        if remaining_s <= 0:
+            return
         key = f"{HEARTBEAT_KEY_PREFIX}{worker_id}"
         value = json.dumps({'last_seen': timestamp, 'status': 'alive'})
         # px, not ex: HEARTBEAT_TIMEOUT is seconds-granularity but short
         # (15s default) - ms precision avoids a worker looking dead for up
         # to a full extra second after a genuine timeout.
-        redis_client.client.set(key, value, px=int(HEARTBEAT_TIMEOUT * 1000))
+        redis_client.client.set(key, value, px=int(remaining_s * 1000))
 
-    def get_active_workers(self, timeout=HEARTBEAT_TIMEOUT):
+    def _scan_heartbeat_keys(self):
+        """SCAN, never KEYS - app/jobstore.py's scan_job_ids() documents
+        why (KEYS blocks the whole server for its entire duration; this
+        runs on a live server, repeatedly, on some of the hottest routes in
+        the system: /upload, /detect, /health, and every /metrics scrape).
+        get_active_workers()/get_all_heartbeats() used KEYS here despite
+        that rule already being established elsewhere in this codebase -
+        found during a full-project review."""
+        keys = []
+        cursor = '0'
+        while cursor != 0:
+            cursor, batch = redis_client.client.scan(
+                cursor=cursor, match=f"{HEARTBEAT_KEY_PREFIX}*", count=1000)
+            keys.extend(batch)
+        return keys
+
+    def get_active_workers(self):
         """Redis's own TTL expiry IS the liveness check now - any key
         present is active by definition, no manual timestamp comparison or
         explicit dead-worker sweep needed (both were real code in the old
         in-memory version; Redis does it for free and can't race with a
         concurrent update the way a manual sweep-then-delete could)."""
-        keys = redis_client.client.keys(f"{HEARTBEAT_KEY_PREFIX}*")
+        keys = self._scan_heartbeat_keys()
         return [k[len(HEARTBEAT_KEY_PREFIX):] for k in keys]
 
     def get_all_heartbeats(self):
-        keys = redis_client.client.keys(f"{HEARTBEAT_KEY_PREFIX}*")
+        keys = self._scan_heartbeat_keys()
         if not keys:
             return {}
         values = redis_client.client.mget(keys)
@@ -82,6 +110,18 @@ def monitor_heartbeats():
 
     consumer_config = master_consumer_conf()
     consumer_config['group.id'] = f'master-heartbeat-monitor-{INSTANCE_ID}'
+    # 'latest', overriding master_consumer_conf()'s 'earliest' default: this
+    # tracker only cares about current worker liveness, not history, and
+    # INSTANCE_ID is hostname-derived (a random container ID in Compose, no
+    # container_name on `master`/`worker` since they're scaled) - so a
+    # restarted replica gets a brand-new consumer group every time and
+    # would otherwise replay the heartbeats topic's full retention window
+    # (Kafka's 7-day default, no override in docker-compose.yml) on every
+    # startup. update()'s own timestamp-based TTL now drops anything stale
+    # anyway, but there's no reason to make the consumer chew through days
+    # of history just to throw nearly all of it away - found in the same
+    # review that caught the TTL bug.
+    consumer_config['auto.offset.reset'] = 'latest'
 
     consumer = Consumer(consumer_config)
 

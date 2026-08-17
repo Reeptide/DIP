@@ -31,7 +31,7 @@ PROMETHEUS_URL = "http://localhost:9090"
 RESULTS_DIR = REPO_ROOT / "bench" / "results"
 
 REPLICA_COUNTS = [1, 2, 4, 8]
-IMAGE_SIZE = 6144  # 144 tiles at TILE_SIZE=512 - same fixed workload every run
+IMAGE_SIZE = 6144  # 576 tiles at the current TILE_SIZE=256 default - same fixed workload every run
 REPLICA_READY_TIMEOUT_S = 90
 
 
@@ -126,7 +126,7 @@ def run():
             print(f"  WARNING: {n} inference replicas did not all come up healthy in time, skipping", file=sys.stderr)
             continue
 
-        print(f"replicas={n:>2}  ({IMAGE_SIZE}x{IMAGE_SIZE}, 144 tiles) ...", end=" ", flush=True)
+        print(f"replicas={n:>2}  ({IMAGE_SIZE}x{IMAGE_SIZE}, 576 tiles) ...", end=" ", flush=True)
         try:
             wall_clock_s, latencies_ms, tiles_count, final_status = upload_and_wait(image)
         except (requests.RequestException, TimeoutError) as e:

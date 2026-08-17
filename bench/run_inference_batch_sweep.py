@@ -1,14 +1,13 @@
 """Batch-size vs latency sweep for the inference stage (Step 9's last item).
 
 For each INFERENCE_BATCH_SIZE in [1, 8, 16, 32]: restart the inference
-container with that env var, upload one large image (144 tiles, enough to
+container with that env var, upload one large image (576 tiles, enough to
 actually fill an 8/16/32 batch), poll /detect/status until complete, record
 wall-clock throughput and p50/p95/p99 from tile_latencies_s.
 
 Runs on the HOST like bench/run_bench.py - needs the docker CLI.
 """
 import csv
-import json
 import subprocess
 import sys
 import time
@@ -23,7 +22,7 @@ MASTER_URL = "http://localhost:5000"
 RESULTS_DIR = REPO_ROOT / "bench" / "results"
 
 BATCH_SIZES = [1, 8, 16, 32]
-IMAGE_SIZE = 6144  # 144 tiles at TILE_SIZE=512
+IMAGE_SIZE = 6144  # 576 tiles at the current TILE_SIZE=256 default
 
 
 def gen_image(seed=7):
@@ -103,7 +102,7 @@ def run():
         stop_bench_container()
         restart_inference(batch_size)
 
-        print(f"batch_size={batch_size:>2}  ({IMAGE_SIZE}x{IMAGE_SIZE}, 144 tiles) ...", end=" ", flush=True)
+        print(f"batch_size={batch_size:>2}  ({IMAGE_SIZE}x{IMAGE_SIZE}, 576 tiles) ...", end=" ", flush=True)
         try:
             wall_clock_s, latencies_ms, tiles_count, final_status = upload_and_wait(image)
         except (requests.RequestException, TimeoutError) as e:
